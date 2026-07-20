@@ -14,7 +14,7 @@ from telegram.ext import (
 
 from app.config import settings
 from app.schemas import JobMode, JobStatus, ShortsMetadata
-from app.services.cleanup import delete_video_file, discard_job
+from app.services.cleanup import clear_video_storage_dir, delete_video_file, discard_job
 from app.services.gemini_client import GeminiMetadataClient, GeminiMetadataError
 from app.services.twitter_downloader import TwitterDownloadError, download_twitter_video
 from app.services.youtube_uploader import YouTubeUploadError, YouTubeUploader
@@ -123,6 +123,7 @@ async def _process_new_url(update: Update, twitter_url: str) -> None:
         from uuid import uuid4
 
         job_id = uuid4().hex[:12]
+        clear_video_storage_dir(settings.video_storage_path)
         video_path = download_twitter_video(
             twitter_url,
             settings.video_storage_path,
