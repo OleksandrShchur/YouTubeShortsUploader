@@ -128,10 +128,16 @@ async def _process_new_url(update: Update, twitter_url: str) -> None:
             settings.video_storage_path,
             job_id,
         )
+        stored_video_path = str(video_path)
+        # #region agent log
+        import json as _json, time as _time
+        with open("debug-25cf5d.log", "a", encoding="utf-8") as _f:
+            _f.write(_json.dumps({"sessionId": "25cf5d", "hypothesisId": "A", "location": "bot.py:create_job", "message": "storing video_path in session", "data": {"type": type(stored_video_path).__name__, "value": stored_video_path, "job_id": job_id}, "timestamp": int(_time.time() * 1000), "runId": "pre-fix"}) + "\n")
+        # #endregion
         session_store.create_job(
             message.chat_id,
             twitter_url,
-            str(video_path),
+            stored_video_path,
             job_id=job_id,
         )
 
@@ -251,6 +257,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         await query.edit_message_text("Uploading to YouTube Shorts...")
+        # #region agent log
+        import json as _json, time as _time
+        from pathlib import Path as _Path
+        _vp = session.video_path
+        with open("debug-25cf5d.log", "a", encoding="utf-8") as _f:
+            _f.write(_json.dumps({"sessionId": "25cf5d", "hypothesisId": "A,B,C", "location": "bot.py:ACTION_APPROVE", "message": "before upload_short", "data": {"type": type(_vp).__name__, "value": str(_vp), "has_exists_attr": hasattr(_vp, "exists"), "file_exists": _Path(_vp).exists() if _vp else False, "job_id": job_id}, "timestamp": int(_time.time() * 1000), "runId": "pre-fix"}) + "\n")
+        # #endregion
         try:
             response = youtube_uploader.upload_short(
                 video_path=session.video_path,

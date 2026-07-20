@@ -31,9 +31,19 @@ class YouTubeUploader:
 
     def upload_short(
         self,
-        video_path: Path,
+        video_path: Path | str,
         metadata: ShortsMetadata,
     ) -> dict:
+        # #region agent log
+        import json as _json, time as _time
+        with open("debug-25cf5d.log", "a", encoding="utf-8") as _f:
+            _f.write(_json.dumps({"sessionId": "25cf5d", "hypothesisId": "A,E", "location": "youtube_uploader.py:upload_short", "message": "upload_short entry", "data": {"type": type(video_path).__name__, "value": str(video_path), "has_exists_attr": hasattr(video_path, "exists")}, "timestamp": int(_time.time() * 1000), "runId": "pre-fix"}) + "\n")
+        # #endregion
+        video_path = Path(video_path)
+        # #region agent log
+        with open("debug-25cf5d.log", "a", encoding="utf-8") as _f:
+            _f.write(_json.dumps({"sessionId": "25cf5d", "hypothesisId": "A", "location": "youtube_uploader.py:upload_short", "message": "after Path conversion", "data": {"type": type(video_path).__name__, "value": str(video_path), "file_exists": video_path.exists()}, "timestamp": int(_time.time() * 1000), "runId": "post-fix"}) + "\n")
+        # #endregion
         if not video_path.exists():
             raise YouTubeUploadError(f"Video file not found: {video_path}")
 
