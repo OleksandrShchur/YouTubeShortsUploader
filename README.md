@@ -1,4 +1,14 @@
-# YouTube Shorts Automation
+---
+title: YouTube Shorts Uploader
+emoji: 🎬
+colorFrom: red
+colorTo: orange
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
+# YouTube Shorts Uploader
 
 Telegram bot pipeline that downloads a video from an X/Twitter post, generates YouTube Shorts metadata with Gemini, and lets a single admin approve, decline, or modify before publishing to YouTube.
 
