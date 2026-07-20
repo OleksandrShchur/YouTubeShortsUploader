@@ -13,6 +13,20 @@ def delete_video_file(video_path: str | Path) -> None:
         logger.info("Deleted video file: %s", path)
 
 
+def clear_video_storage_dir(storage_dir: Path) -> int:
+    """Delete all files in the video storage directory. Returns count deleted."""
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    deleted = 0
+    for path in storage_dir.iterdir():
+        if path.is_file() and path.name != ".gitkeep":
+            path.unlink()
+            deleted += 1
+            logger.info("Deleted video file: %s", path)
+    if deleted:
+        logger.info("Cleared %d file(s) from %s", deleted, storage_dir)
+    return deleted
+
+
 def cleanup_job_video(job_id: str) -> None:
     session = session_store.get(job_id)
     if not session:
