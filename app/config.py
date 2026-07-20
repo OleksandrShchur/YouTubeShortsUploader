@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     admin_chat_id: int
 
     gemini_api_key: str
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-3.5-flash"
 
     youtube_client_secrets_file: Path = Path("secrets/client_secret.json")
     youtube_token_file: Path = Path("secrets/youtube_token.json")
