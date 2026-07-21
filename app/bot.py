@@ -13,7 +13,7 @@ from telegram.ext import (
 )
 
 from app.config import settings
-from app.schemas import JobMode, JobStatus, ShortsMetadata
+from app.schemas import ChatFlow, JobMode, JobStatus, ShortsMetadata
 from app.services.cleanup import clear_video_storage_dir, delete_video_file, discard_job
 from app.services.gemini_client import GeminiMetadataClient, GeminiMetadataError
 from app.services.twitter_downloader import TwitterDownloadError, download_twitter_video
@@ -31,6 +31,12 @@ logger = logging.getLogger(__name__)
 ACTION_APPROVE = "approve"
 ACTION_DECLINE = "decline"
 ACTION_MODIFY = "modify"
+ACTION_BACK_MENU = "back_menu"
+
+MENU_TEXT = (
+    "Available commands:\n"
+    "/twitter — download an X/Twitter video, generate Shorts metadata, then publish"
+)
 
 gemini_client = GeminiMetadataClient()
 youtube_uploader = YouTubeUploader()
@@ -48,6 +54,12 @@ async def _reject_unauthorized(update: Update) -> None:
         )
 
 
+def _build_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Back to menu", callback_data=ACTION_BACK_MENU)]]
+    )
+
+
 def _build_action_keyboard(job_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -56,8 +68,13 @@ def _build_action_keyboard(job_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Decline", callback_data=f"{ACTION_DECLINE}:{job_id}"),
             ],
             [InlineKeyboardButton("Modify", callback_data=f"{ACTION_MODIFY}:{job_id}")],
+            [InlineKeyboardButton("Back to menu", callback_data=ACTION_BACK_MENU)],
         ]
     )
+
+
+async def _send_menu(message) -> None:
+    await message.reply_text(MENU_TEXT)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -65,10 +82,43 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _reject_unauthorized(update)
         return
 
-    await update.effective_message.reply_text(
+    await _send_menu(update.effective_message)
+
+
+async def twitter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await _reject_unauthorized(update)
+        return
+
+    message = update.effective_message
+    if not message:
+        return
+
+    active = session_store.get_active_for_chat(message.chat_id)
+
+    if active and active.mode == JobMode.PROCESSING:
+        await message.reply_text("A job is already processing. Please wait.")
+        return
+
+    if active and active.status == JobStatus.PENDING_REVIEW:
+        if active.mode == JobMode.AWAITING_MODIFIED_JSON:
+            await message.reply_text(
+                "You are waiting to send modified JSON for a pending review. "
+                "Use Back to menu, or send the JSON, or Decline the review first."
+            )
+            return
+        await message.reply_text(
+            "You have a pending review. Use the buttons on the latest metadata message, "
+            "or Decline it before starting a new URL."
+        )
+        return
+
+    session_store.set_chat_flow(message.chat_id, ChatFlow.TWITTER)
+    await message.reply_text(
         "Send an X/Twitter post URL with a video.\n\n"
         "I will download it, generate Shorts metadata with Gemini, "
-        "and ask you to Approve, Decline, or Modify before publishing."
+        "and ask you to Approve, Decline, or Modify before publishing.",
+        reply_markup=_build_back_keyboard(),
     )
 
 
@@ -99,13 +149,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    if session_store.get_chat_flow(message.chat_id) != ChatFlow.TWITTER:
+        await message.reply_text(
+            "Use /twitter to start the Twitter Shorts flow, or /start for available commands."
+        )
+        return
+
     if not is_twitter_url(text):
-        await message.reply_text("Please send a valid X/Twitter post URL containing a video.")
+        await message.reply_text(
+            "Please send a valid X/Twitter post URL containing a video.",
+            reply_markup=_build_back_keyboard(),
+        )
         return
 
     twitter_url = extract_twitter_url(text)
     if not twitter_url:
-        await message.reply_text("Could not parse the X/Twitter URL.")
+        await message.reply_text(
+            "Could not parse the X/Twitter URL.",
+            reply_markup=_build_back_keyboard(),
+        )
         return
 
     await _process_new_url(update, twitter_url)
@@ -204,11 +266,50 @@ async def _handle_modified_json(update: Update, job_id: str, text: str) -> None:
     try:
         metadata = parse_modified_json(text)
     except ValueError as exc:
-        await message.reply_text(f"Invalid metadata JSON: {exc}")
+        await message.reply_text(
+            f"Invalid metadata JSON: {exc}",
+            reply_markup=_build_back_keyboard(),
+        )
         return
 
     await _send_review_message(message, job_id, metadata)
     await message.reply_text("Updated metadata received. Review the latest JSON and choose an action.")
+
+
+async def _handle_back_to_menu(update: Update) -> None:
+    query = update.callback_query
+    assert query is not None
+    message = query.message
+    chat_id = message.chat_id if message else None
+    if chat_id is None:
+        return
+
+    active = session_store.get_active_for_chat(chat_id)
+
+    if active and active.mode == JobMode.PROCESSING:
+        await query.answer(
+            "A job is processing. Please wait until it finishes.",
+            show_alert=True,
+        )
+        return
+
+    if active and active.mode == JobMode.AWAITING_MODIFIED_JSON:
+        session_store.set_mode(active.job_id, JobMode.AWAITING_URL)
+        session_store.set_chat_flow(chat_id, ChatFlow.IDLE)
+        await query.answer()
+        await message.reply_text(MENU_TEXT)
+        return
+
+    if active and active.status == JobStatus.PENDING_REVIEW:
+        await query.answer(
+            "You have a pending review. Decline it first to leave this job.",
+            show_alert=True,
+        )
+        return
+
+    session_store.set_chat_flow(chat_id, ChatFlow.IDLE)
+    await query.answer()
+    await message.reply_text(MENU_TEXT)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -216,11 +317,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not query or not query.data:
         return
 
-    await query.answer()
-
     if not _is_admin(update):
+        await query.answer()
         await query.edit_message_text("Unauthorized.")
         return
+
+    if query.data == ACTION_BACK_MENU:
+        await _handle_back_to_menu(update)
+        return
+
+    await query.answer()
 
     try:
         action, job_id = query.data.split(":", 1)
@@ -243,6 +349,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Send the modified metadata as JSON with these fields:\n"
             "`title`, `description`, `viral_title_tags`, `shorts_tags`",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_build_back_keyboard(),
         )
         return
 
@@ -250,6 +357,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         delete_video_file(session.video_path)
         session_store.complete(job_id, JobStatus.DECLINED)
         await query.edit_message_text("Declined. Video removed. No YouTube upload.")
+        await query.message.reply_text(MENU_TEXT)
         return
 
     if action == ACTION_APPROVE:
@@ -287,6 +395,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"URL: {html.escape(youtube_url)}",
             parse_mode=ParseMode.HTML,
         )
+        await query.message.reply_text(MENU_TEXT)
         return
 
     await query.edit_message_text("Unknown action.")
@@ -299,6 +408,7 @@ def create_telegram_application() -> Application:
         .build()
     )
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("twitter", twitter_command))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )

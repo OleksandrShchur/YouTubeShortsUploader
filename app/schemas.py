@@ -16,6 +16,11 @@ class JobMode(str, Enum):
     PROCESSING = "processing"
 
 
+class ChatFlow(str, Enum):
+    IDLE = "idle"
+    TWITTER = "twitter"
+
+
 class ShortsMetadata(BaseModel):
     title: str = Field(..., min_length=1, max_length=100)
     description: str = Field(..., min_length=1)

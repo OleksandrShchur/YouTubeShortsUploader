@@ -2,13 +2,23 @@ import time
 import uuid
 from typing import Optional
 
-from app.schemas import JobMode, JobSession, JobStatus, ShortsMetadata
+from app.schemas import ChatFlow, JobMode, JobSession, JobStatus, ShortsMetadata
 
 
 class SessionStore:
     def __init__(self) -> None:
         self._sessions: dict[str, JobSession] = {}
         self._chat_active_job: dict[int, str] = {}
+        self._chat_flow: dict[int, ChatFlow] = {}
+
+    def get_chat_flow(self, chat_id: int) -> ChatFlow:
+        return self._chat_flow.get(chat_id, ChatFlow.IDLE)
+
+    def set_chat_flow(self, chat_id: int, flow: ChatFlow) -> None:
+        if flow == ChatFlow.IDLE:
+            self._chat_flow.pop(chat_id, None)
+        else:
+            self._chat_flow[chat_id] = flow
 
     def create_job(
         self,
@@ -73,12 +83,15 @@ class SessionStore:
         self._sessions[job_id] = session
         if self._chat_active_job.get(session.chat_id) == job_id:
             del self._chat_active_job[session.chat_id]
+        self.set_chat_flow(session.chat_id, ChatFlow.IDLE)
         return session
 
     def remove(self, job_id: str) -> Optional[JobSession]:
         session = self._sessions.pop(job_id, None)
         if session and self._chat_active_job.get(session.chat_id) == job_id:
             del self._chat_active_job[session.chat_id]
+        if session:
+            self.set_chat_flow(session.chat_id, ChatFlow.IDLE)
         return session
 
     def list_stale(self, ttl_seconds: float) -> list[JobSession]:
