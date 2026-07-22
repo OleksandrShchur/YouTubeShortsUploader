@@ -43,7 +43,8 @@ PIXABAY_PHRASE_PROMPT = f"""You invent a single stock-video search phrase for th
 Return ONLY the search phrase as plain text (no quotes, no markdown, no JSON).
 
 Rules:
-- One short English phrase suitable for Pixabay video search (max 100 characters).
+- One short English phrase suitable for Pixabay video search (at most 4 words). Start with current season
+- Example style: summer rainy window.
 - Prefer cozy ambient / nature / rain / fireplace / misty forest / study nook / soft interior scenes.
 - Avoid celebrity names, brands, logos, text overlays, faces looking at camera, neon cyberpunk.
 - Do not include hashtags or punctuation fluff.
@@ -191,8 +192,9 @@ def _normalize_pixabay_phrase(text: str) -> str:
 
     cleaned = cleaned.strip().strip('"').strip("'")
     cleaned = re.sub(r"\s+", " ", cleaned)
-    if len(cleaned) > 100:
-        cleaned = cleaned[:100].rstrip()
+    words = cleaned.split()
+    if len(words) > 4:
+        cleaned = " ".join(words[:4])
     return cleaned
 
 
