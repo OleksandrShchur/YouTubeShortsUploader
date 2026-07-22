@@ -43,8 +43,8 @@ PIXABAY_PHRASE_PROMPT = f"""You invent a single stock-video search phrase for th
 Return ONLY the search phrase as plain text (no quotes, no markdown, no JSON).
 
 Rules:
-- One short English phrase suitable for Pixabay video search (at most 4 words). Start with current season
-- Example style: summer rainy window.
+- One short English phrase suitable for Pixabay video search (at most 4 words). Start with CURRENT season name (eg "summer", "winter", "spring", "fall").
+- Example style: summer sea waves.
 - Prefer cozy ambient / nature / rain / fireplace / misty forest / study nook / soft interior scenes.
 - Avoid celebrity names, brands, logos, text overlays, faces looking at camera, neon cyberpunk.
 - Do not include hashtags or punctuation fluff.
