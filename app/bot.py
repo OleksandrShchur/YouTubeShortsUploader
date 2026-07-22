@@ -684,14 +684,30 @@ async def _handle_video_stage_action(update: Update, action: str, job_id: str) -
     assert query is not None
     message = query.message
     session = session_store.get(job_id)
+    # #region agent log
+    try:
+        import json as _json, time as _time
+        with open("debug-083327.log", "a", encoding="utf-8") as _f:
+            _f.write(_json.dumps({"sessionId":"083327","hypothesisId":"H1","location":"bot.py:_handle_video_stage_action","message":"video_stage_action_entry","data":{"action":action,"job_id":job_id,"has_session":session is not None,"has_message":message is not None},"timestamp":int(_time.time()*1000),"runId":"post-fix"}) + "\n")
+    except Exception:
+        pass
+    # #endregion
     if not session or not message:
+        # #region agent log
+        try:
+            import json as _json, time as _time
+            with open("debug-083327.log", "a", encoding="utf-8") as _f:
+                _f.write(_json.dumps({"sessionId":"083327","hypothesisId":"H1","location":"bot.py:_handle_video_stage_action","message":"early_return_missing_session_or_message","data":{"job_id":job_id},"timestamp":int(_time.time()*1000),"runId":"post-fix"}) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        return
+
     if action == ACTION_DECLINE:
         delete_video_file(session.video_path)
         session_store.complete(job_id, JobStatus.DECLINED)
         await _edit_callback_message(query, "Declined. Video removed.")
         await message.reply_text(MENU_TEXT)
-        return
-
         return
 
     if action == ACTION_MODIFY:
@@ -880,4 +896,12 @@ def create_telegram_application() -> Application:
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
     application.add_handler(CallbackQueryHandler(handle_callback))
+    # #region agent log
+    try:
+        import json as _json, time as _time
+        with open("debug-083327.log", "a", encoding="utf-8") as _f:
+            _f.write(_json.dumps({"sessionId":"083327","hypothesisId":"H1","location":"bot.py:create_telegram_application","message":"bot_module_importable_app_built","data":{"handlers":len(application.handlers.get(0, []))},"timestamp":int(_time.time()*1000),"runId":"post-fix"}) + "\n")
+    except Exception:
+        pass
+    # #endregion
     return application
