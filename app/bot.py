@@ -685,13 +685,13 @@ async def _handle_video_stage_action(update: Update, action: str, job_id: str) -
     message = query.message
     session = session_store.get(job_id)
     if not session or not message:
-        return
-
     if action == ACTION_DECLINE:
         delete_video_file(session.video_path)
         session_store.complete(job_id, JobStatus.DECLINED)
         await _edit_callback_message(query, "Declined. Video removed.")
         await message.reply_text(MENU_TEXT)
+        return
+
         return
 
     if action == ACTION_MODIFY:
