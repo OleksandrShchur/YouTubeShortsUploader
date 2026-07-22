@@ -1,8 +1,16 @@
 import time
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
-from app.schemas import ChatFlow, JobMode, JobSession, JobStatus, ShortsMetadata
+from app.schemas import (
+    ChatFlow,
+    JobMode,
+    JobSession,
+    JobSource,
+    JobStatus,
+    ReviewStage,
+    ShortsMetadata,
+)
 
 
 class SessionStore:
@@ -23,19 +31,26 @@ class SessionStore:
     def create_job(
         self,
         chat_id: int,
-        twitter_url: str,
         video_path: str,
+        *,
         job_id: str | None = None,
+        source: JobSource = JobSource.TWITTER,
+        twitter_url: str | None = None,
+        review_stage: ReviewStage = ReviewStage.METADATA,
+        video_prompts: dict[str, Any] | None = None,
     ) -> JobSession:
         now = time.time()
         resolved_job_id = job_id or uuid.uuid4().hex[:12]
         session = JobSession(
             job_id=resolved_job_id,
             chat_id=chat_id,
+            source=source,
             twitter_url=twitter_url,
             video_path=video_path,
             status=JobStatus.PENDING_REVIEW,
             mode=JobMode.PROCESSING,
+            review_stage=review_stage,
+            video_prompts=video_prompts,
             created_at=now,
             updated_at=now,
         )
@@ -52,16 +67,42 @@ class SessionStore:
             return None
         return self._sessions.get(job_id)
 
+    def update_video(
+        self,
+        job_id: str,
+        video_path: str,
+        *,
+        video_prompts: dict[str, Any] | None = None,
+        review_stage: ReviewStage = ReviewStage.VIDEO,
+        mode: JobMode = JobMode.AWAITING_URL,
+        review_message_id: int | None = None,
+    ) -> JobSession:
+        session = self._require(job_id)
+        session.video_path = video_path
+        session.review_stage = review_stage
+        session.mode = mode
+        session.status = JobStatus.PENDING_REVIEW
+        session.metadata = None
+        session.updated_at = time.time()
+        if video_prompts is not None:
+            session.video_prompts = video_prompts
+        if review_message_id is not None:
+            session.review_message_id = review_message_id
+        self._sessions[job_id] = session
+        return session
+
     def update_metadata(
         self,
         job_id: str,
         metadata: ShortsMetadata,
         review_message_id: Optional[int] = None,
         mode: JobMode = JobMode.AWAITING_URL,
+        review_stage: ReviewStage = ReviewStage.METADATA,
     ) -> JobSession:
         session = self._require(job_id)
         session.metadata = metadata
         session.mode = mode
+        session.review_stage = review_stage
         session.status = JobStatus.PENDING_REVIEW
         session.updated_at = time.time()
         if review_message_id is not None:
@@ -72,6 +113,13 @@ class SessionStore:
     def set_mode(self, job_id: str, mode: JobMode) -> JobSession:
         session = self._require(job_id)
         session.mode = mode
+        session.updated_at = time.time()
+        self._sessions[job_id] = session
+        return session
+
+    def set_review_stage(self, job_id: str, review_stage: ReviewStage) -> JobSession:
+        session = self._require(job_id)
+        session.review_stage = review_stage
         session.updated_at = time.time()
         self._sessions[job_id] = session
         return session

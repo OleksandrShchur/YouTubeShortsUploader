@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -19,6 +19,17 @@ class JobMode(str, Enum):
 class ChatFlow(str, Enum):
     IDLE = "idle"
     TWITTER = "twitter"
+    HUGGING_FACE = "hugging_face"
+
+
+class JobSource(str, Enum):
+    TWITTER = "twitter"
+    HUGGING_FACE = "huggingface"
+
+
+class ReviewStage(str, Enum):
+    VIDEO = "video"
+    METADATA = "metadata"
 
 
 class ShortsMetadata(BaseModel):
@@ -45,14 +56,30 @@ class ShortsMetadata(BaseModel):
         return str(value).strip()
 
 
+class VideoClipPrompt(BaseModel):
+    index: int
+    duration_hint_seconds: float = Field(..., ge=1, le=15)
+    prompt: str = Field(..., min_length=1)
+
+
+class VideoPromptPlan(BaseModel):
+    scene_summary: str = Field(..., min_length=1)
+    target_duration_seconds: float = Field(..., ge=8, le=15)
+    negative_prompt: str = Field(..., min_length=1)
+    clips: list[VideoClipPrompt] = Field(..., min_length=1, max_length=4)
+
+
 class JobSession(BaseModel):
     job_id: str
     chat_id: int
-    twitter_url: str
+    source: JobSource = JobSource.TWITTER
+    twitter_url: Optional[str] = None
     video_path: str
     metadata: Optional[ShortsMetadata] = None
     status: JobStatus = JobStatus.PENDING_REVIEW
     mode: JobMode = JobMode.AWAITING_URL
+    review_stage: ReviewStage = ReviewStage.METADATA
     review_message_id: Optional[int] = None
+    video_prompts: Optional[dict[str, Any]] = None
     created_at: float
     updated_at: float

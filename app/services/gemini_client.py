@@ -9,7 +9,8 @@ from google.genai import errors as genai_errors
 from google.genai import types
 
 from app.config import settings
-from app.schemas import ShortsMetadata
+from app.prompts.midnight_souls import DEFAULT_NEGATIVE_PROMPT, VIDEO_PROMPT_SYSTEM
+from app.schemas import ShortsMetadata, VideoClipPrompt, VideoPromptPlan
 from app.utils.metadata_rules import normalize_metadata
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ Rules:
 - viral_title_tags must contain exactly 3 or 4 short viral hashtags (without # prefix)
 - shorts_tags must contain all relevant tags for the YouTube tags field (5-15 tags, no # prefix)
 - description should be optimized for Shorts discovery
+- lean into cozy ambient / lofi / nature / study-relaxation vibes when they fit the video
 - return JSON only
 """
 
@@ -39,25 +41,38 @@ class GeminiMetadataError(Exception):
     pass
 
 
-def _debug_log(hypothesis_id: str, location: str, message: str, data: dict, run_id: str = "pre-fix") -> None:
-    # region agent log
-    payload = {
-        "sessionId": "88be4a",
-        "runId": run_id,
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    with open(Path("debug-88be4a.log"), "a", encoding="utf-8") as f:
-        f.write(json.dumps(payload) + "\n")
-    # endregion
-
-
 class GeminiMetadataClient:
     def __init__(self) -> None:
         self._client = genai.Client(api_key=settings.gemini_api_key)
+
+    def generate_video_prompts(
+        self,
+        target_duration_seconds: float | None = None,
+    ) -> VideoPromptPlan:
+        duration = target_duration_seconds or settings.hf_target_duration_seconds
+        duration = max(8.0, min(15.0, float(duration)))
+        user_message = (
+            f"Invent a new Midnight Souls Shorts scene. "
+            f"Prefer target_duration_seconds around {duration:.0f}."
+        )
+        try:
+            response = self._client.models.generate_content(
+                model=settings.gemini_model,
+                contents=[VIDEO_PROMPT_SYSTEM, user_message],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.9,
+                ),
+            )
+        except genai_errors.ClientError as exc:
+            raise self._map_client_error(exc) from exc
+
+        raw_text = (response.text or "").strip()
+        if not raw_text:
+            raise GeminiMetadataError("Gemini returned an empty video-prompt response.")
+
+        payload = _parse_json_response(raw_text)
+        return _normalize_video_prompt_plan(payload, preferred_duration=duration)
 
     def generate_metadata(self, video_path: Path) -> ShortsMetadata:
         if not video_path.exists():
@@ -65,11 +80,6 @@ class GeminiMetadataClient:
 
         uploaded_file = self._client.files.upload(file=str(video_path))
 
-        # region agent log
-        _debug_log("H1", "gemini_client.py:post_upload", "File uploaded, checking state", {"state": str(getattr(uploaded_file, 'state', 'unknown')), "name": uploaded_file.name})
-        # endregion
-
-        # Wait for file to become ACTIVE
         poll_started_at = time.monotonic()
         state = getattr(uploaded_file, "state", None)
         while state:
@@ -84,9 +94,6 @@ class GeminiMetadataClient:
             time.sleep(GEMINI_FILE_POLL_INTERVAL_SECONDS)
             uploaded_file = self._client.files.get(name=uploaded_file.name)
             state = getattr(uploaded_file, "state", None)
-            # region agent log
-            _debug_log("H1", "gemini_client.py:poll_state", "Polling file state", {"state": str(state), "name": uploaded_file.name})
-            # endregion
 
         try:
             response = self._client.models.generate_content(
@@ -104,14 +111,7 @@ class GeminiMetadataClient:
                 ),
             )
         except genai_errors.ClientError as exc:
-            status_code = getattr(exc, "status_code", None)
-            if status_code == 429:
-                raise GeminiMetadataError(
-                    f"Gemini quota exceeded for model '{settings.gemini_model}'. "
-                    "Wait a minute and retry, check usage at https://ai.dev/rate-limit, "
-                    "or try a different model in GEMINI_MODEL (e.g. gemini-3.5-flash)."
-                ) from exc
-            raise GeminiMetadataError(f"Gemini API error ({status_code}): {exc}") from exc
+            raise self._map_client_error(exc) from exc
         finally:
             try:
                 if uploaded_file.name:
@@ -125,6 +125,16 @@ class GeminiMetadataClient:
 
         payload = _parse_json_response(raw_text)
         return normalize_metadata(payload)
+
+    def _map_client_error(self, exc: genai_errors.ClientError) -> GeminiMetadataError:
+        status_code = getattr(exc, "status_code", None)
+        if status_code == 429:
+            return GeminiMetadataError(
+                f"Gemini quota exceeded for model '{settings.gemini_model}'. "
+                "Wait a minute and retry, check usage at https://ai.dev/rate-limit, "
+                "or try a different model in GEMINI_MODEL (e.g. gemini-3.5-flash)."
+            )
+        return GeminiMetadataError(f"Gemini API error ({status_code}): {exc}")
 
 
 def _parse_json_response(text: str) -> dict:
@@ -141,3 +151,66 @@ def _parse_json_response(text: str) -> dict:
     if not isinstance(data, dict):
         raise GeminiMetadataError("Gemini JSON root must be an object.")
     return data
+
+
+def _normalize_video_prompt_plan(
+    payload: dict,
+    preferred_duration: float,
+) -> VideoPromptPlan:
+    clips_raw = payload.get("clips")
+    if not isinstance(clips_raw, list) or not clips_raw:
+        raise GeminiMetadataError("Gemini video prompts must include a non-empty clips list.")
+
+    clips: list[VideoClipPrompt] = []
+    for idx, item in enumerate(clips_raw[:4], start=1):
+        if not isinstance(item, dict):
+            raise GeminiMetadataError("Each clip prompt must be an object.")
+        prompt = str(item.get("prompt") or "").strip()
+        if not prompt:
+            raise GeminiMetadataError(f"Clip {idx} is missing a prompt.")
+        hint = item.get("duration_hint_seconds", preferred_duration / max(len(clips_raw[:4]), 1))
+        try:
+            hint_f = float(hint)
+        except (TypeError, ValueError) as exc:
+            raise GeminiMetadataError(f"Clip {idx} has invalid duration_hint_seconds.") from exc
+        clips.append(
+            VideoClipPrompt(
+                index=int(item.get("index") or idx),
+                duration_hint_seconds=max(1.0, min(15.0, hint_f)),
+                prompt=prompt,
+            )
+        )
+
+    if len(clips) < 2:
+        # Ensure at least 2 clips for merge strategy when free-tier clips are short.
+        first = clips[0]
+        clips.append(
+            VideoClipPrompt(
+                index=2,
+                duration_hint_seconds=first.duration_hint_seconds,
+                prompt=(
+                    f"Seamless continuation of the exact same scene and camera: {first.prompt}. "
+                    "Same lighting, palette, and subject; gentle ongoing ambient motion only."
+                ),
+            )
+        )
+
+    target = payload.get("target_duration_seconds", preferred_duration)
+    try:
+        target_f = float(target)
+    except (TypeError, ValueError):
+        target_f = preferred_duration
+    target_f = max(8.0, min(15.0, target_f))
+
+    negative = str(payload.get("negative_prompt") or DEFAULT_NEGATIVE_PROMPT).strip()
+    if not negative:
+        negative = DEFAULT_NEGATIVE_PROMPT
+
+    scene_summary = str(payload.get("scene_summary") or "Cozy ambient Midnight Souls scene").strip()
+
+    return VideoPromptPlan(
+        scene_summary=scene_summary,
+        target_duration_seconds=target_f,
+        negative_prompt=negative,
+        clips=clips,
+    )

@@ -1,27 +1,41 @@
 # YouTube Shorts Uploader
 
-Telegram bot pipeline that downloads a video from an X/Twitter post, generates YouTube Shorts metadata with Gemini, and lets a single admin approve, decline, or modify before publishing to YouTube.
+Telegram bot pipeline for publishing YouTube Shorts. Two flows:
 
-## Flow
+1. **`/twitter`** — download a video from an X/Twitter post, generate metadata with Gemini, review, publish.
+2. **`/hugging_face`** — invent a Midnight Souls scene with Gemini, generate vertical HD video via Hugging Face Inference Providers, review the video, then metadata, publish.
 
-1. Admin sends an X/Twitter post URL to the Telegram bot.
+## Flows
+
+### Twitter
+
+1. Admin sends `/twitter`, then an X/Twitter post URL.
 2. Server clears `storage/videos/` and downloads the video there.
-3. Server sends the video to Gemini and receives JSON metadata:
-   - `title`
-   - `description`
-   - `viral_title_tags` (3-4 tags appended to title)
-   - `shorts_tags` (YouTube tags field)
-4. Bot returns formatted JSON with buttons: **Approve**, **Decline**, **Modify**.
-5. **Approve** uploads to YouTube Shorts immediately, then deletes the local video.
+3. Server sends the video to Gemini and receives JSON metadata (`title`, `description`, `viral_title_tags`, `shorts_tags`).
+4. Bot returns formatted JSON with **Approve**, **Decline**, **Modify**.
+5. **Approve** uploads to YouTube Shorts, then deletes the local video.
 6. **Decline** deletes the local video and stops.
-7. **Modify** asks the admin to paste edited JSON; bot validates it and sends updated JSON with the same buttons. The video stays on disk.
+7. **Modify** asks for edited JSON; bot re-shows the review keyboard.
+
+### Hugging Face (Midnight Souls)
+
+1. Admin sends `/hugging_face` (starts immediately — no topic input).
+2. Gemini invents a cozy ambient scene and 2–4 continuity-aware clip prompts for the channel brand.
+3. Hugging Face generates clips (text-to-video, then image-to-video from the last frame when possible).
+4. ffmpeg merges/normalizes to **1080×1920**, **8–15 seconds**, H.264 mp4.
+5. Bot sends the video to Telegram with **Approve** / **Decline** / **Modify**.
+6. **Approve** → Gemini metadata JSON + second review keyboard.
+7. **Modify** (video stage) → regenerate a new video.
+8. **Modify** (metadata stage) → paste edited JSON (same as Twitter).
+9. **Approve** (metadata) → YouTube upload; **Decline** → delete and stop.
 
 ## Requirements
 
 - Python 3.12+
-- [ffmpeg](https://ffmpeg.org/) (used by yt-dlp to merge video and audio)
+- [ffmpeg](https://ffmpeg.org/) (yt-dlp merge + HF clip merge/normalize)
 - Telegram bot token
 - Gemini API key (Google AI Studio)
+- Hugging Face token with Inference Providers permission (`HF_TOKEN`)
 - Google Cloud project with YouTube Data API v3 enabled
 - OAuth client credentials for desktop/installed app
 
@@ -70,7 +84,13 @@ Edit `.env` with your values. See [Environment variables](#environment-variables
 2. Set `GEMINI_API_KEY`.
 3. Optionally set `GEMINI_MODEL` (default: `gemini-3.5-flash`).
 
-### 5. YouTube OAuth
+### 5. Hugging Face
+
+1. Create an access token at [Hugging Face settings](https://huggingface.co/settings/tokens) with Inference Providers permission.
+2. Set `HF_TOKEN`.
+3. Optionally override `HF_VIDEO_MODEL`, `HF_I2V_MODEL`, `HF_PROVIDER`, and `HF_TARGET_DURATION_SECONDS`.
+
+### 6. YouTube OAuth
 
 1. In [Google Cloud Console](https://console.cloud.google.com/), enable **YouTube Data API v3**.
 2. Create OAuth credentials for a **Desktop app**.
@@ -79,7 +99,7 @@ Edit `.env` with your values. See [Environment variables](#environment-variables
 
 For Docker or headless deployment, generate `secrets/youtube_token.json` locally first, then provide it to the container (see [Docker](#docker)).
 
-### 6. Run locally
+### 7. Run locally
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000
@@ -105,8 +125,7 @@ The container listens on port **7860** and includes ffmpeg. OAuth credential fil
 ```bash
 docker run --env-file .env \
   -v ./secrets:/app/secrets \
-  -p 7860:7860 \
-  youtube-shorts-uploader
+  -p 7860:7860 youtube-shorts-uploader
 ```
 
 **Option B — inject JSON via environment variables** (useful on platforms without persistent volumes):
@@ -115,8 +134,7 @@ docker run --env-file .env \
 docker run --env-file .env \
   -e YOUTUBE_CLIENT_SECRETS_JSON='{"installed":{...}}' \
   -e YOUTUBE_TOKEN_JSON='{"token":"...","refresh_token":"..."}' \
-  -p 7860:7860 \
-  youtube-shorts-uploader
+  -p 7860:7860 youtube-shorts-uploader
 ```
 
 The entrypoint writes these variables to `secrets/client_secret.json` and `secrets/youtube_token.json` at startup. Browser-based OAuth does not work inside the container, so create the token file locally before deploying.
@@ -128,12 +146,17 @@ The entrypoint writes these variables to `secrets/client_secret.json` and `secre
 | `TELEGRAM_BOT_TOKEN` | yes | — | Bot token from @BotFather |
 | `ADMIN_CHAT_ID` | yes | — | Telegram chat ID allowed to use the bot |
 | `GEMINI_API_KEY` | yes | — | Google AI Studio API key |
-| `GEMINI_MODEL` | no | `gemini-3.5-flash` | Gemini model for metadata generation |
+| `GEMINI_MODEL` | no | `gemini-3.5-flash` | Gemini model for prompts/metadata |
+| `HF_TOKEN` | for `/hugging_face` | — | Hugging Face token (Inference Providers) |
+| `HF_VIDEO_MODEL` | no | `Lightricks/LTX-Video-0.9.8-13B-distilled` | Text-to-video model |
+| `HF_I2V_MODEL` | no | `Wan-AI/Wan2.2-I2V-A14B` | Image-to-video continuity model |
+| `HF_PROVIDER` | no | `auto` | Inference provider routing |
+| `HF_TARGET_DURATION_SECONDS` | no | `12` | Preferred Shorts length (8–15) |
 | `YOUTUBE_CLIENT_SECRETS_FILE` | no | `secrets/client_secret.json` | Path to OAuth client JSON |
 | `YOUTUBE_TOKEN_FILE` | no | `secrets/youtube_token.json` | Path to saved OAuth token |
 | `YOUTUBE_PRIVACY_STATUS` | no | `private` | `private`, `public`, or `unlisted` |
 | `YOUTUBE_CATEGORY_ID` | no | `22` | YouTube category (22 = People & Blogs) |
-| `VIDEO_STORAGE_DIR` | no | `storage/videos` | Temporary video download directory |
+| `VIDEO_STORAGE_DIR` | no | `storage/videos` | Temporary video directory |
 | `SESSION_TTL_HOURS` | no | `24` | Hours before stale pending jobs are removed on startup |
 | `YOUTUBE_CLIENT_SECRETS_JSON` | no | — | Docker: inline OAuth client JSON |
 | `YOUTUBE_TOKEN_JSON` | no | — | Docker: inline OAuth token JSON |
@@ -141,13 +164,10 @@ The entrypoint writes these variables to `secrets/client_secret.json` and `secre
 ## Usage
 
 1. Start a chat with your bot and send `/start`.
-2. Send an X/Twitter URL with a video, for example:
-   `https://x.com/user/status/1234567890`
-3. Wait for Gemini metadata JSON and review it. The response includes a `display_title` preview (title + viral hashtags).
-4. Choose an action:
-   - **Approve** → uploads to YouTube
-   - **Decline** → cancels and deletes video
-   - **Modify** → paste updated JSON like:
+2. Use `/twitter` with an X/Twitter URL, or `/hugging_face` to generate an AI Short.
+3. Review video (HF) and/or metadata JSON, then choose an action.
+
+Modify metadata JSON shape:
 
 ```json
 {
@@ -165,18 +185,23 @@ Only the four metadata fields above are required when modifying; `display_title`
 ```
 app/
   main.py              # FastAPI app + Telegram bot lifecycle
-  bot.py               # Telegram handlers and review flow
+  bot.py               # Telegram handlers and review flows
   config.py            # Settings from environment
   schemas.py           # Pydantic models
   session_store.py     # In-memory job state
+  prompts/
+    midnight_souls.py  # Channel brand brief for HF video prompts
   services/
     twitter_downloader.py
     gemini_client.py
+    huggingface_video.py
+    video_pipeline.py
+    ffmpeg_utils.py
     youtube_uploader.py
     cleanup.py
   utils/
     metadata_rules.py
-storage/videos/        # Temporary downloaded videos
+storage/videos/        # Temporary videos
 secrets/               # OAuth credentials (not committed)
 Dockerfile
 entrypoint.sh
@@ -187,5 +212,6 @@ entrypoint.sh
 - Only the configured `ADMIN_CHAT_ID` can use the bot.
 - Session state is in-memory only; restarting the server clears pending jobs.
 - Stale pending sessions and videos older than `SESSION_TTL_HOURS` are cleaned on startup.
-- Starting a new URL clears any leftover files in `storage/videos/`.
+- Starting a new Twitter URL or HF job clears leftover files in `storage/videos/`.
 - Default YouTube privacy is `private`; change `YOUTUBE_PRIVACY_STATUS` to `public` or `unlisted` if needed.
+- Hugging Face free-tier clips are often short; the pipeline merges 2–4 continuity clips to reach 8–15 seconds.

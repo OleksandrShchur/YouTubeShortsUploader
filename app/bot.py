@@ -1,5 +1,8 @@
+import asyncio
 import html
 import logging
+from pathlib import Path
+from uuid import uuid4
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -13,10 +16,18 @@ from telegram.ext import (
 )
 
 from app.config import settings
-from app.schemas import ChatFlow, JobMode, JobStatus, ShortsMetadata
+from app.schemas import (
+    ChatFlow,
+    JobMode,
+    JobSource,
+    JobStatus,
+    ReviewStage,
+    ShortsMetadata,
+)
 from app.services.cleanup import clear_video_storage_dir, delete_video_file, discard_job
 from app.services.gemini_client import GeminiMetadataClient, GeminiMetadataError
 from app.services.twitter_downloader import TwitterDownloadError, download_twitter_video
+from app.services.video_pipeline import HuggingFaceVideoPipeline, VideoPipelineError
 from app.services.youtube_uploader import YouTubeUploadError, YouTubeUploader
 from app.session_store import session_store
 from app.utils.metadata_rules import (
@@ -35,11 +46,13 @@ ACTION_BACK_MENU = "back_menu"
 
 MENU_TEXT = (
     "Available commands:\n"
-    "/twitter — download an X/Twitter video, generate Shorts metadata, then publish"
+    "/twitter — download an X/Twitter video, generate Shorts metadata, then publish\n"
+    "/hugging_face — generate an AI Short for Midnight Souls, then review & publish"
 )
 
 gemini_client = GeminiMetadataClient()
 youtube_uploader = YouTubeUploader()
+hf_pipeline = HuggingFaceVideoPipeline(gemini_client=gemini_client)
 
 
 def _is_admin(update: Update) -> bool:
@@ -73,6 +86,42 @@ def _build_action_keyboard(job_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def _has_blocking_job(chat_id: int) -> tuple[bool, str | None]:
+    active = session_store.get_active_for_chat(chat_id)
+    if not active:
+        return False, None
+    if active.mode == JobMode.PROCESSING:
+        return True, "A job is already processing. Please wait."
+    if active.status == JobStatus.PENDING_REVIEW:
+        if active.mode == JobMode.AWAITING_MODIFIED_JSON:
+            return (
+                True,
+                "You are waiting to send modified JSON for a pending review. "
+                "Use Back to menu, or send the JSON, or Decline the review first.",
+            )
+        stage = "video" if active.review_stage == ReviewStage.VIDEO else "metadata"
+        return (
+            True,
+            f"You have a pending {stage} review. Use the buttons on the latest review "
+            "message, or Decline it before starting a new job.",
+        )
+    return False, None
+
+
+async def _edit_callback_message(query, text: str, *, parse_mode: str | None = None) -> None:
+    """Edit text or caption depending on whether the callback message is a video."""
+    message = query.message
+    if message is None:
+        return
+    try:
+        if message.video or message.document or message.animation:
+            await query.edit_message_caption(caption=text, parse_mode=parse_mode)
+        else:
+            await query.edit_message_text(text, parse_mode=parse_mode)
+    except Exception:
+        await message.reply_text(text, parse_mode=parse_mode)
+
+
 async def _send_menu(message) -> None:
     await message.reply_text(MENU_TEXT)
 
@@ -94,23 +143,9 @@ async def twitter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not message:
         return
 
-    active = session_store.get_active_for_chat(message.chat_id)
-
-    if active and active.mode == JobMode.PROCESSING:
-        await message.reply_text("A job is already processing. Please wait.")
-        return
-
-    if active and active.status == JobStatus.PENDING_REVIEW:
-        if active.mode == JobMode.AWAITING_MODIFIED_JSON:
-            await message.reply_text(
-                "You are waiting to send modified JSON for a pending review. "
-                "Use Back to menu, or send the JSON, or Decline the review first."
-            )
-            return
-        await message.reply_text(
-            "You have a pending review. Use the buttons on the latest metadata message, "
-            "or Decline it before starting a new URL."
-        )
+    blocked, reason = _has_blocking_job(message.chat_id)
+    if blocked:
+        await message.reply_text(reason or "A job is already in progress.")
         return
 
     session_store.set_chat_flow(message.chat_id, ChatFlow.TWITTER)
@@ -120,6 +155,31 @@ async def twitter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "and ask you to Approve, Decline, or Modify before publishing.",
         reply_markup=_build_back_keyboard(),
     )
+
+
+async def hugging_face_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await _reject_unauthorized(update)
+        return
+
+    message = update.effective_message
+    if not message:
+        return
+
+    blocked, reason = _has_blocking_job(message.chat_id)
+    if blocked:
+        await message.reply_text(reason or "A job is already in progress.")
+        return
+
+    if not settings.hf_token:
+        await message.reply_text(
+            "HF_TOKEN is not configured. Add a Hugging Face token with "
+            "Inference Providers permission to .env, then retry /hugging_face."
+        )
+        return
+
+    session_store.set_chat_flow(message.chat_id, ChatFlow.HUGGING_FACE)
+    await _run_hugging_face_generation(message)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -143,15 +203,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if active and active.status == JobStatus.PENDING_REVIEW:
+        stage = "video" if active.review_stage == ReviewStage.VIDEO else "metadata"
         await message.reply_text(
-            "You have a pending review. Use the buttons on the latest metadata message, "
-            "or Decline it before starting a new URL."
+            f"You have a pending {stage} review. Use the buttons on the latest review "
+            "message, or Decline it before starting a new job."
         )
         return
 
     if session_store.get_chat_flow(message.chat_id) != ChatFlow.TWITTER:
         await message.reply_text(
-            "Use /twitter to start the Twitter Shorts flow, or /start for available commands."
+            "Use /twitter or /hugging_face to start a Shorts flow, "
+            "or /start for available commands."
         )
         return
 
@@ -182,8 +244,6 @@ async def _process_new_url(update: Update, twitter_url: str) -> None:
     job_id: str | None = None
     video_path = None
     try:
-        from uuid import uuid4
-
         job_id = uuid4().hex[:12]
         clear_video_storage_dir(settings.video_storage_path)
         video_path = download_twitter_video(
@@ -192,21 +252,18 @@ async def _process_new_url(update: Update, twitter_url: str) -> None:
             job_id,
         )
         stored_video_path = str(video_path)
-        # #region agent log
-        import json as _json, time as _time
-        with open("debug-25cf5d.log", "a", encoding="utf-8") as _f:
-            _f.write(_json.dumps({"sessionId": "25cf5d", "hypothesisId": "A", "location": "bot.py:create_job", "message": "storing video_path in session", "data": {"type": type(stored_video_path).__name__, "value": stored_video_path, "job_id": job_id}, "timestamp": int(_time.time() * 1000), "runId": "pre-fix"}) + "\n")
-        # #endregion
         session_store.create_job(
             message.chat_id,
-            twitter_url,
             stored_video_path,
             job_id=job_id,
+            source=JobSource.TWITTER,
+            twitter_url=twitter_url,
+            review_stage=ReviewStage.METADATA,
         )
 
         await status_msg.edit_text("Generating metadata with Gemini...")
-        metadata = gemini_client.generate_metadata(video_path)
-        await _send_review_message(message, job_id, metadata, status_msg)
+        metadata = await asyncio.to_thread(gemini_client.generate_metadata, video_path)
+        await _send_metadata_review(message, job_id, metadata, status_msg)
     except TwitterDownloadError as exc:
         if job_id:
             discard_job(job_id)
@@ -228,7 +285,127 @@ async def _process_new_url(update: Update, twitter_url: str) -> None:
         await status_msg.edit_text("An unexpected error occurred while processing the URL.")
 
 
-async def _send_review_message(
+async def _run_hugging_face_generation(message, *, existing_job_id: str | None = None) -> None:
+    status_msg = await message.reply_text("Starting Hugging Face Shorts generation...")
+    job_id = existing_job_id or uuid4().hex[:12]
+    video_path: Path | None = None
+
+    loop = asyncio.get_running_loop()
+    progress_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    def on_progress(text: str) -> None:
+        loop.call_soon_threadsafe(progress_queue.put_nowait, text)
+
+    async def drain_progress() -> None:
+        while True:
+            item = await progress_queue.get()
+            if item is None:
+                break
+            try:
+                await status_msg.edit_text(item)
+            except Exception:
+                logger.debug("Could not edit progress message", exc_info=True)
+
+    progress_task = asyncio.create_task(drain_progress())
+
+    try:
+        if existing_job_id:
+            session = session_store.get(existing_job_id)
+            if not session:
+                await progress_queue.put(None)
+                await progress_task
+                await status_msg.edit_text("This job no longer exists.")
+                await message.reply_text(MENU_TEXT)
+                return
+            if session.video_path:
+                delete_video_file(session.video_path)
+            session_store.set_mode(job_id, JobMode.PROCESSING)
+            session_store.set_review_stage(job_id, ReviewStage.VIDEO)
+        else:
+            clear_video_storage_dir(settings.video_storage_path)
+            pending_path = str(settings.video_storage_path / f"{job_id}.pending")
+            session_store.create_job(
+                message.chat_id,
+                pending_path,
+                job_id=job_id,
+                source=JobSource.HUGGING_FACE,
+                review_stage=ReviewStage.VIDEO,
+            )
+
+        video_path, plan = await asyncio.to_thread(
+            hf_pipeline.generate,
+            settings.video_storage_path,
+            job_id,
+            on_progress=on_progress,
+        )
+        await progress_queue.put(None)
+        await progress_task
+
+        session_store.update_video(
+            job_id,
+            str(video_path),
+            video_prompts=plan.model_dump(),
+            review_stage=ReviewStage.VIDEO,
+            mode=JobMode.AWAITING_URL,
+        )
+        await _send_video_review(message, job_id, video_path, plan.scene_summary, status_msg)
+    except VideoPipelineError as exc:
+        await progress_queue.put(None)
+        await progress_task
+        if job_id:
+            discard_job(job_id)
+        elif video_path:
+            delete_video_file(video_path)
+        await status_msg.edit_text(f"Hugging Face generation failed: {exc}")
+        await message.reply_text(MENU_TEXT)
+    except Exception:
+        logger.exception("Unexpected Hugging Face generation error")
+        await progress_queue.put(None)
+        await progress_task
+        if job_id:
+            discard_job(job_id)
+        elif video_path:
+            delete_video_file(video_path)
+        await status_msg.edit_text("An unexpected error occurred during video generation.")
+        await message.reply_text(MENU_TEXT)
+
+
+async def _send_video_review(
+    message,
+    job_id: str,
+    video_path: Path,
+    scene_summary: str,
+    status_msg=None,
+) -> None:
+    caption = (
+        "Generated Midnight Souls Short (video review):\n"
+        f"{scene_summary}\n\n"
+        "Approve → generate title/description with Gemini\n"
+        "Modify → generate a new video\n"
+        "Decline → discard"
+    )
+    with video_path.open("rb") as video_file:
+        review_message = await message.reply_video(
+            video=video_file,
+            caption=caption,
+            reply_markup=_build_action_keyboard(job_id),
+            supports_streaming=True,
+        )
+    session_store.update_video(
+        job_id,
+        str(video_path),
+        review_stage=ReviewStage.VIDEO,
+        mode=JobMode.AWAITING_URL,
+        review_message_id=review_message.message_id,
+    )
+    if status_msg:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+
+async def _send_metadata_review(
     message,
     job_id: str,
     metadata: ShortsMetadata,
@@ -249,9 +426,13 @@ async def _send_review_message(
         metadata,
         review_message_id=review_message.message_id,
         mode=JobMode.AWAITING_URL,
+        review_stage=ReviewStage.METADATA,
     )
     if status_msg:
-        await status_msg.delete()
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
 
 async def _handle_modified_json(update: Update, job_id: str, text: str) -> None:
@@ -272,8 +453,10 @@ async def _handle_modified_json(update: Update, job_id: str, text: str) -> None:
         )
         return
 
-    await _send_review_message(message, job_id, metadata)
-    await message.reply_text("Updated metadata received. Review the latest JSON and choose an action.")
+    await _send_metadata_review(message, job_id, metadata)
+    await message.reply_text(
+        "Updated metadata received. Review the latest JSON and choose an action."
+    )
 
 
 async def _handle_back_to_menu(update: Update) -> None:
@@ -312,6 +495,119 @@ async def _handle_back_to_menu(update: Update) -> None:
     await message.reply_text(MENU_TEXT)
 
 
+async def _handle_video_stage_action(update: Update, action: str, job_id: str) -> None:
+    query = update.callback_query
+    assert query is not None
+    message = query.message
+    session = session_store.get(job_id)
+    if not session or not message:
+        return
+
+    if action == ACTION_DECLINE:
+        delete_video_file(session.video_path)
+        session_store.complete(job_id, JobStatus.DECLINED)
+        await _edit_callback_message(query, "Declined. Video removed.")
+        await message.reply_text(MENU_TEXT)
+        return
+
+    if action == ACTION_MODIFY:
+        await _edit_callback_message(query, "Regenerating a new video...")
+        await _run_hugging_face_generation(message, existing_job_id=job_id)
+        return
+
+    if action == ACTION_APPROVE:
+        video_path = Path(session.video_path)
+        if not video_path.exists():
+            await _edit_callback_message(query, "Video file is missing; cannot generate metadata.")
+            return
+
+        await _edit_callback_message(query, "Generating metadata with Gemini...")
+        session_store.set_mode(job_id, JobMode.PROCESSING)
+        try:
+            metadata = await asyncio.to_thread(gemini_client.generate_metadata, video_path)
+        except GeminiMetadataError as exc:
+            session_store.set_mode(job_id, JobMode.AWAITING_URL)
+            await message.reply_text(
+                f"Gemini processing failed: {exc}",
+                reply_markup=_build_action_keyboard(job_id),
+            )
+            return
+        except Exception:
+            logger.exception("Unexpected Gemini metadata error")
+            session_store.set_mode(job_id, JobMode.AWAITING_URL)
+            await message.reply_text(
+                "An unexpected error occurred while generating metadata.",
+                reply_markup=_build_action_keyboard(job_id),
+            )
+            return
+
+        await _send_metadata_review(message, job_id, metadata)
+        return
+
+    await _edit_callback_message(query, "Unknown action.")
+
+
+async def _handle_metadata_stage_action(update: Update, action: str, job_id: str) -> None:
+    query = update.callback_query
+    assert query is not None
+    message = query.message
+    session = session_store.get(job_id)
+    if not session or not message:
+        return
+
+    if action == ACTION_MODIFY:
+        session_store.set_mode(job_id, JobMode.AWAITING_MODIFIED_JSON)
+        await message.reply_text(
+            "Send the modified metadata as JSON with these fields:\n"
+            "`title`, `description`, `viral_title_tags`, `shorts_tags`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_build_back_keyboard(),
+        )
+        return
+
+    if action == ACTION_DECLINE:
+        delete_video_file(session.video_path)
+        session_store.complete(job_id, JobStatus.DECLINED)
+        await _edit_callback_message(query, "Declined. Video removed. No YouTube upload.")
+        await message.reply_text(MENU_TEXT)
+        return
+
+    if action == ACTION_APPROVE:
+        if not session.metadata:
+            await _edit_callback_message(query, "No metadata available for upload.")
+            return
+
+        await _edit_callback_message(query, "Uploading to YouTube Shorts...")
+        try:
+            response = await asyncio.to_thread(
+                youtube_uploader.upload_short,
+                session.video_path,
+                session.metadata,
+            )
+        except YouTubeUploadError as exc:
+            await message.reply_text(f"YouTube upload failed: {exc}")
+            return
+        except Exception:
+            logger.exception("Unexpected YouTube upload error")
+            await message.reply_text("An unexpected error occurred during YouTube upload.")
+            return
+
+        video_id = response.get("id", "unknown")
+        youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+        delete_video_file(session.video_path)
+        session_store.complete(job_id, JobStatus.APPROVED)
+        await _edit_callback_message(
+            query,
+            f"Published to YouTube.\n\nVideo ID: <code>{html.escape(video_id)}</code>\n"
+            f"URL: {html.escape(youtube_url)}",
+            parse_mode=ParseMode.HTML,
+        )
+        await message.reply_text(MENU_TEXT)
+        return
+
+    await _edit_callback_message(query, "Unknown action.")
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.data:
@@ -319,7 +615,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if not _is_admin(update):
         await query.answer()
-        await query.edit_message_text("Unauthorized.")
+        await _edit_callback_message(query, "Unauthorized.")
         return
 
     if query.data == ACTION_BACK_MENU:
@@ -331,74 +627,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         action, job_id = query.data.split(":", 1)
     except ValueError:
-        await query.edit_message_text("Invalid action.")
+        await _edit_callback_message(query, "Invalid action.")
         return
 
     session = session_store.get(job_id)
     if not session:
-        await query.edit_message_text("This job no longer exists.")
+        await _edit_callback_message(query, "This job no longer exists.")
         return
 
     if session.chat_id != query.message.chat_id:
         await query.answer("This action belongs to another chat.", show_alert=True)
         return
 
-    if action == ACTION_MODIFY:
-        session_store.set_mode(job_id, JobMode.AWAITING_MODIFIED_JSON)
-        await query.message.reply_text(
-            "Send the modified metadata as JSON with these fields:\n"
-            "`title`, `description`, `viral_title_tags`, `shorts_tags`",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_build_back_keyboard(),
-        )
+    if session.mode == JobMode.PROCESSING:
+        await query.answer("This job is still processing. Please wait.", show_alert=True)
         return
 
-    if action == ACTION_DECLINE:
-        delete_video_file(session.video_path)
-        session_store.complete(job_id, JobStatus.DECLINED)
-        await query.edit_message_text("Declined. Video removed. No YouTube upload.")
-        await query.message.reply_text(MENU_TEXT)
+    if session.review_stage == ReviewStage.VIDEO:
+        await _handle_video_stage_action(update, action, job_id)
         return
 
-    if action == ACTION_APPROVE:
-        if not session.metadata:
-            await query.edit_message_text("No metadata available for upload.")
-            return
-
-        await query.edit_message_text("Uploading to YouTube Shorts...")
-        # #region agent log
-        import json as _json, time as _time
-        from pathlib import Path as _Path
-        _vp = session.video_path
-        with open("debug-25cf5d.log", "a", encoding="utf-8") as _f:
-            _f.write(_json.dumps({"sessionId": "25cf5d", "hypothesisId": "A,B,C", "location": "bot.py:ACTION_APPROVE", "message": "before upload_short", "data": {"type": type(_vp).__name__, "value": str(_vp), "has_exists_attr": hasattr(_vp, "exists"), "file_exists": _Path(_vp).exists() if _vp else False, "job_id": job_id}, "timestamp": int(_time.time() * 1000), "runId": "pre-fix"}) + "\n")
-        # #endregion
-        try:
-            response = youtube_uploader.upload_short(
-                video_path=session.video_path,
-                metadata=session.metadata,
-            )
-        except YouTubeUploadError as exc:
-            await query.message.reply_text(f"YouTube upload failed: {exc}")
-            return
-        except Exception:
-            logger.exception("Unexpected YouTube upload error")
-            await query.message.reply_text("An unexpected error occurred during YouTube upload.")
-            return
-
-        video_id = response.get("id", "unknown")
-        youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-        delete_video_file(session.video_path)
-        session_store.complete(job_id, JobStatus.APPROVED)
-        await query.edit_message_text(
-            f"Published to YouTube.\n\nVideo ID: <code>{html.escape(video_id)}</code>\n"
-            f"URL: {html.escape(youtube_url)}",
-            parse_mode=ParseMode.HTML,
-        )
-        await query.message.reply_text(MENU_TEXT)
-        return
-
-    await query.edit_message_text("Unknown action.")
+    await _handle_metadata_stage_action(update, action, job_id)
 
 
 def create_telegram_application() -> Application:
@@ -409,6 +658,7 @@ def create_telegram_application() -> Application:
     )
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("twitter", twitter_command))
+    application.add_handler(CommandHandler("hugging_face", hugging_face_command))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
