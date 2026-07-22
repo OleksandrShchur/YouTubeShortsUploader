@@ -85,7 +85,7 @@ def find_and_download_video(
     if not settings.pixabay_api_key:
         raise PixabayError("PIXABAY_API_KEY is not configured.")
 
-    cleaned_phrase = " ".join(phrase.strip().split()[:4])
+    cleaned_phrase = " ".join(phrase.strip().split())
     if not cleaned_phrase:
         raise PixabayError("Search phrase is empty.")
 
