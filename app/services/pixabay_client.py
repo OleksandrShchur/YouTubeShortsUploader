@@ -76,7 +76,7 @@ def find_and_download_video(
     if not settings.pixabay_api_key:
         raise PixabayError("PIXABAY_API_KEY is not configured.")
 
-    cleaned_phrase = phrase.strip()
+    cleaned_phrase = " ".join(phrase.strip().split()[:4])
     if not cleaned_phrase:
         raise PixabayError("Search phrase is empty.")
 
@@ -135,6 +135,10 @@ def _search_videos(phrase: str, *, page: int) -> dict[str, Any]:
             "q": phrase,
             "video_type": "film",
             "safesearch": "true",
+            "orientation": "vertical",
+            "order": "latest",
+            "min_width": 720,
+            "min_height": 720,
             "per_page": 50,
             "page": page,
         }
