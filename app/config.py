@@ -25,10 +25,12 @@ class Settings(BaseSettings):
     session_ttl_hours: int = 24
 
     hf_token: str = ""
-    hf_video_model: str = "Lightricks/LTX-Video-0.9.8-13B-distilled"
+    hf_video_model: str = "Wan-AI/Wan2.2-TI2V-5B"
     hf_i2v_model: str = "Wan-AI/Wan2.2-I2V-A14B"
     hf_provider: str = "auto"
     hf_target_duration_seconds: float = 12.0
+
+    pixabay_api_key: str = ""
 
     @property
     def video_storage_path(self) -> Path:

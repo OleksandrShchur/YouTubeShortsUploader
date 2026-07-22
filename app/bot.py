@@ -26,6 +26,12 @@ from app.schemas import (
 )
 from app.services.cleanup import clear_video_storage_dir, delete_video_file, discard_job
 from app.services.gemini_client import GeminiMetadataClient, GeminiMetadataError
+from app.services.pixabay_client import (
+    PixabayError,
+    PixabayExhaustedError,
+    PixabayVideoResult,
+    find_and_download_video,
+)
 from app.services.twitter_downloader import TwitterDownloadError, download_twitter_video
 from app.services.video_pipeline import HuggingFaceVideoPipeline, VideoPipelineError
 from app.services.youtube_uploader import YouTubeUploadError, YouTubeUploader
@@ -43,12 +49,16 @@ ACTION_APPROVE = "approve"
 ACTION_DECLINE = "decline"
 ACTION_MODIFY = "modify"
 ACTION_BACK_MENU = "back_menu"
+ACTION_START_PIXABAY = "start_pixabay"
 
 MENU_TEXT = (
     "Available commands:\n"
     "/twitter — download an X/Twitter video, generate Shorts metadata, then publish\n"
-    "/hugging_face — generate an AI Short for Midnight Souls, then review & publish"
+    "/hugging_face — generate an AI Short for Midnight Souls, then review & publish\n"
+    "/pixabay — fetch a vertical HD Pixabay Short for Midnight Souls, then review & publish"
 )
+
+MAX_PIXABAY_PHRASE_ATTEMPTS = 3
 
 gemini_client = GeminiMetadataClient()
 youtube_uploader = YouTubeUploader()
@@ -70,6 +80,15 @@ async def _reject_unauthorized(update: Update) -> None:
 def _build_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("Back to menu", callback_data=ACTION_BACK_MENU)]]
+    )
+
+
+def _build_pixabay_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Start", callback_data=ACTION_START_PIXABAY)],
+            [InlineKeyboardButton("Back to menu", callback_data=ACTION_BACK_MENU)],
+        ]
     )
 
 
@@ -182,6 +201,38 @@ async def hugging_face_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await _run_hugging_face_generation(message)
 
 
+async def pixabay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await _reject_unauthorized(update)
+        return
+
+    message = update.effective_message
+    if not message:
+        return
+
+    blocked, reason = _has_blocking_job(message.chat_id)
+    if blocked:
+        await message.reply_text(reason or "A job is already in progress.")
+        return
+
+    if not settings.pixabay_api_key:
+        await message.reply_text(
+            "PIXABAY_API_KEY is not configured. Get a free key at "
+            "https://pixabay.com/api/docs/ (log in to see it), add it to .env, "
+            "then retry /pixabay."
+        )
+        return
+
+    session_store.set_chat_flow(message.chat_id, ChatFlow.PIXABAY)
+    await message.reply_text(
+        "Ready to fetch a Midnight Souls Pixabay Short.\n\n"
+        "Gemini will invent a phrase of the day, then I will download a vertical HD "
+        "video (≤60s, original quality) for review before publishing.\n\n"
+        "Tap Start to begin, or Back to menu if this was a misclick.",
+        reply_markup=_build_pixabay_confirm_keyboard(),
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update):
         await _reject_unauthorized(update)
@@ -212,7 +263,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if session_store.get_chat_flow(message.chat_id) != ChatFlow.TWITTER:
         await message.reply_text(
-            "Use /twitter or /hugging_face to start a Shorts flow, "
+            "Use /twitter, /hugging_face, or /pixabay to start a Shorts flow, "
             "or /start for available commands."
         )
         return
@@ -370,14 +421,147 @@ async def _run_hugging_face_generation(message, *, existing_job_id: str | None =
         await message.reply_text(MENU_TEXT)
 
 
+def _pixabay_review_caption(result: PixabayVideoResult) -> str:
+    return (
+        "Pixabay Midnight Souls Short (video review):\n"
+        f"Phrase: {result.phrase}\n"
+        f"{result.attribution}\n\n"
+        "Approve → generate title/description with Gemini\n"
+        "Modify → next video (same phrase, or new phrase if exhausted)\n"
+        "Decline → discard"
+    )
+
+
+async def _run_pixabay_generation(
+    message,
+    *,
+    existing_job_id: str | None = None,
+) -> None:
+    status_msg = await message.reply_text("Starting Pixabay Shorts fetch...")
+    job_id = existing_job_id or uuid4().hex[:12]
+    video_path: Path | None = None
+    used_ids: list[int] = []
+    phrase: str | None = None
+
+    try:
+        if existing_job_id:
+            session = session_store.get(existing_job_id)
+            if not session:
+                await status_msg.edit_text("This job no longer exists.")
+                await message.reply_text(MENU_TEXT)
+                return
+            if session.video_path:
+                delete_video_file(session.video_path)
+            used_ids = list(session.pixabay_used_ids or [])
+            phrase = session.pixabay_phrase
+            session_store.set_mode(job_id, JobMode.PROCESSING)
+            session_store.set_review_stage(job_id, ReviewStage.VIDEO)
+        else:
+            clear_video_storage_dir(settings.video_storage_path)
+            pending_path = str(settings.video_storage_path / f"{job_id}.pending")
+            session_store.create_job(
+                message.chat_id,
+                pending_path,
+                job_id=job_id,
+                source=JobSource.PIXABAY,
+                review_stage=ReviewStage.VIDEO,
+            )
+
+        result: PixabayVideoResult | None = None
+        last_error: Exception | None = None
+
+        for attempt in range(1, MAX_PIXABAY_PHRASE_ATTEMPTS + 1):
+            if not phrase:
+                await status_msg.edit_text(
+                    f"Inventing Midnight Souls phrase of the day with Gemini "
+                    f"(attempt {attempt}/{MAX_PIXABAY_PHRASE_ATTEMPTS})..."
+                )
+                phrase = await asyncio.to_thread(gemini_client.generate_pixabay_phrase)
+
+            await status_msg.edit_text(
+                f"Searching Pixabay for vertical HD video:\n{phrase}"
+            )
+            try:
+                result = await asyncio.to_thread(
+                    find_and_download_video,
+                    phrase,
+                    settings.video_storage_path,
+                    job_id,
+                    used_ids=used_ids,
+                )
+                break
+            except PixabayExhaustedError as exc:
+                last_error = exc
+                logger.info("Pixabay exhausted for phrase %r: %s", phrase, exc)
+                phrase = None
+                continue
+
+        if result is None:
+            raise last_error or PixabayError(
+                "Could not find a suitable vertical HD Pixabay video after several phrases."
+            )
+
+        video_path = result.local_path
+        used_ids = [*used_ids, result.video_id]
+        pixabay_meta = {
+            "video_id": result.video_id,
+            "page_url": result.page_url,
+            "user": result.user,
+            "duration": result.duration,
+            "width": result.stream.width,
+            "height": result.stream.height,
+        }
+        session_store.update_video(
+            job_id,
+            str(video_path),
+            review_stage=ReviewStage.VIDEO,
+            mode=JobMode.AWAITING_URL,
+            pixabay_phrase=result.phrase,
+            pixabay_used_ids=used_ids,
+            pixabay_meta=pixabay_meta,
+        )
+        await _send_video_review(
+            message,
+            job_id,
+            video_path,
+            result.phrase,
+            status_msg,
+            caption=_pixabay_review_caption(result),
+        )
+    except GeminiMetadataError as exc:
+        if job_id:
+            discard_job(job_id)
+        elif video_path:
+            delete_video_file(video_path)
+        await status_msg.edit_text(f"Gemini phrase generation failed: {exc}")
+        await message.reply_text(MENU_TEXT)
+    except PixabayError as exc:
+        if job_id:
+            discard_job(job_id)
+        elif video_path:
+            delete_video_file(video_path)
+        await status_msg.edit_text(f"Pixabay fetch failed: {exc}")
+        await message.reply_text(MENU_TEXT)
+    except Exception:
+        logger.exception("Unexpected Pixabay generation error")
+        if job_id:
+            discard_job(job_id)
+        elif video_path:
+            delete_video_file(video_path)
+        await status_msg.edit_text("An unexpected error occurred during Pixabay fetch.")
+        await message.reply_text(MENU_TEXT)
+
+
 async def _send_video_review(
     message,
     job_id: str,
     video_path: Path,
     scene_summary: str,
     status_msg=None,
+    *,
+    caption: str | None = None,
 ) -> None:
-    caption = (
+    resolved_caption = caption or (
         "Generated Midnight Souls Short (video review):\n"
         f"{scene_summary}\n\n"
         "Approve → generate title/description with Gemini\n"
@@ -387,7 +571,7 @@ async def _send_video_review(
     with video_path.open("rb") as video_file:
         review_message = await message.reply_video(
             video=video_file,
-            caption=caption,
+            caption=resolved_caption,
             reply_markup=_build_action_keyboard(job_id),
             supports_streaming=True,
         )
@@ -501,8 +685,6 @@ async def _handle_video_stage_action(update: Update, action: str, job_id: str) -
     message = query.message
     session = session_store.get(job_id)
     if not session or not message:
-        return
-
     if action == ACTION_DECLINE:
         delete_video_file(session.video_path)
         session_store.complete(job_id, JobStatus.DECLINED)
@@ -510,7 +692,13 @@ async def _handle_video_stage_action(update: Update, action: str, job_id: str) -
         await message.reply_text(MENU_TEXT)
         return
 
+        return
+
     if action == ACTION_MODIFY:
+        if session.source == JobSource.PIXABAY:
+            await _edit_callback_message(query, "Fetching another Pixabay video...")
+            await _run_pixabay_generation(message, existing_job_id=job_id)
+            return
         await _edit_callback_message(query, "Regenerating a new video...")
         await _run_hugging_face_generation(message, existing_job_id=job_id)
         return
@@ -622,6 +810,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _handle_back_to_menu(update)
         return
 
+    if query.data == ACTION_START_PIXABAY:
+        message = query.message
+        if not message:
+            await query.answer()
+            return
+
+        chat_id = message.chat_id
+        blocked, reason = _has_blocking_job(chat_id)
+        if blocked:
+            await query.answer(reason or "A job is already in progress.", show_alert=True)
+            return
+
+        await query.answer()
+
+        if not settings.pixabay_api_key:
+            await _edit_callback_message(
+                query,
+                "PIXABAY_API_KEY is not configured. Add it to .env and retry /pixabay.",
+            )
+            return
+
+        if session_store.get_chat_flow(chat_id) != ChatFlow.PIXABAY:
+            session_store.set_chat_flow(chat_id, ChatFlow.PIXABAY)
+
+        await _edit_callback_message(query, "Starting Pixabay flow...")
+        await _run_pixabay_generation(message)
+        return
+
     await query.answer()
 
     try:
@@ -659,6 +875,7 @@ def create_telegram_application() -> Application:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("twitter", twitter_command))
     application.add_handler(CommandHandler("hugging_face", hugging_face_command))
+    application.add_handler(CommandHandler("pixabay", pixabay_command))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )

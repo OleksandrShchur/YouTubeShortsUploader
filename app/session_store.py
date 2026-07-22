@@ -38,6 +38,9 @@ class SessionStore:
         twitter_url: str | None = None,
         review_stage: ReviewStage = ReviewStage.METADATA,
         video_prompts: dict[str, Any] | None = None,
+        pixabay_phrase: str | None = None,
+        pixabay_used_ids: list[int] | None = None,
+        pixabay_meta: dict[str, Any] | None = None,
     ) -> JobSession:
         now = time.time()
         resolved_job_id = job_id or uuid.uuid4().hex[:12]
@@ -51,6 +54,9 @@ class SessionStore:
             mode=JobMode.PROCESSING,
             review_stage=review_stage,
             video_prompts=video_prompts,
+            pixabay_phrase=pixabay_phrase,
+            pixabay_used_ids=list(pixabay_used_ids or []),
+            pixabay_meta=pixabay_meta,
             created_at=now,
             updated_at=now,
         )
@@ -76,6 +82,9 @@ class SessionStore:
         review_stage: ReviewStage = ReviewStage.VIDEO,
         mode: JobMode = JobMode.AWAITING_URL,
         review_message_id: int | None = None,
+        pixabay_phrase: str | None = None,
+        pixabay_used_ids: list[int] | None = None,
+        pixabay_meta: dict[str, Any] | None = None,
     ) -> JobSession:
         session = self._require(job_id)
         session.video_path = video_path
@@ -88,6 +97,12 @@ class SessionStore:
             session.video_prompts = video_prompts
         if review_message_id is not None:
             session.review_message_id = review_message_id
+        if pixabay_phrase is not None:
+            session.pixabay_phrase = pixabay_phrase
+        if pixabay_used_ids is not None:
+            session.pixabay_used_ids = list(pixabay_used_ids)
+        if pixabay_meta is not None:
+            session.pixabay_meta = pixabay_meta
         self._sessions[job_id] = session
         return session
 

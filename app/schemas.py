@@ -20,11 +20,13 @@ class ChatFlow(str, Enum):
     IDLE = "idle"
     TWITTER = "twitter"
     HUGGING_FACE = "hugging_face"
+    PIXABAY = "pixabay"
 
 
 class JobSource(str, Enum):
     TWITTER = "twitter"
     HUGGING_FACE = "huggingface"
+    PIXABAY = "pixabay"
 
 
 class ReviewStage(str, Enum):
@@ -81,5 +83,8 @@ class JobSession(BaseModel):
     review_stage: ReviewStage = ReviewStage.METADATA
     review_message_id: Optional[int] = None
     video_prompts: Optional[dict[str, Any]] = None
+    pixabay_phrase: Optional[str] = None
+    pixabay_used_ids: list[int] = Field(default_factory=list)
+    pixabay_meta: Optional[dict[str, Any]] = None
     created_at: float
     updated_at: float
