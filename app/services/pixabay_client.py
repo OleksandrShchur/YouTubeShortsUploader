@@ -1,4 +1,4 @@
-"""Pixabay Video API search + lossless download of 9:16 Shorts HD clips."""
+"""Pixabay Video API search + lossless download of 9:16 Shorts HD/4K clips."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ PIXABAY_VIDEOS_URL = "https://pixabay.com/api/videos/"
 CACHE_TTL_SECONDS = 24 * 60 * 60
 MIN_DURATION_SECONDS = 1
 MAX_DURATION_SECONDS = 60
+# HD floor (720p). SD streams/videos are below this and are excluded.
 MIN_SHORT_SIDE = 720
 # YouTube Shorts target: width:height = 9:16  →  height/width = 16/9
 TARGET_ASPECT_HW = 16 / 9
@@ -28,7 +29,8 @@ ASPECT_RATIO_TOLERANCE = 0.05
 # 720p 9:16 short side → 720x1280
 MIN_WIDTH = 720
 MIN_HEIGHT = 1280
-STREAM_KEYS = ("large", "medium", "small", "tiny")
+# Pixabay renditions: large≈4K, medium≈HD. Omit small/tiny (SD-tier).
+STREAM_KEYS = ("large", "medium")
 USER_AGENT = "YouTubeShortsUploader/1.0"
 
 
@@ -37,7 +39,7 @@ class PixabayError(Exception):
 
 
 class PixabayExhaustedError(PixabayError):
-    """No unused 9:16 HD clips left for this phrase (within searched pages)."""
+    """No unused 9:16 HD/4K clips left for this phrase (within searched pages)."""
 
 
 @dataclass(frozen=True)
@@ -79,7 +81,7 @@ def find_and_download_video(
     used_ids: list[int] | None = None,
     max_pages: int = 5,
 ) -> PixabayVideoResult:
-    """Search Pixabay and download the next unused 9:16 HD clip for ``phrase``."""
+    """Search Pixabay and download the next unused 9:16 HD/4K clip for ``phrase``."""
     if not settings.pixabay_api_key:
         raise PixabayError("PIXABAY_API_KEY is not configured.")
 
@@ -103,8 +105,11 @@ def find_and_download_video(
                 continue
             if video_id in used:
                 continue
+            # Skip SD-only assets; keep HD and 4K.
+            if _is_sd_only_video(hit):
+                continue
 
-            stream = _best_nine_sixteen_hd_stream(hit)
+            stream = _best_nine_sixteen_stream(hit)
             if stream is None:
                 continue
 
@@ -124,7 +129,7 @@ def find_and_download_video(
             )
 
     raise PixabayExhaustedError(
-        f"No unused 9:16 HD Pixabay videos (≤{MAX_DURATION_SECONDS}s) "
+        f"No unused 9:16 HD/4K Pixabay videos (≤{MAX_DURATION_SECONDS}s) "
         f"found for phrase: {cleaned_phrase!r}"
     )
 
@@ -180,12 +185,43 @@ def _is_nine_sixteen(width: int, height: int) -> bool:
     return abs((height / width) - TARGET_ASPECT_HW) <= ASPECT_RATIO_TOLERANCE
 
 
-def _best_nine_sixteen_hd_stream(hit: dict[str, Any]) -> PixabayStream | None:
+def _iter_stream_dicts(hit: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    videos = hit.get("videos")
+    if not isinstance(videos, dict):
+        return []
+    out: list[tuple[str, dict[str, Any]]] = []
+    for key in ("large", "medium", "small", "tiny"):
+        raw = videos.get(key)
+        if isinstance(raw, dict):
+            out.append((key, raw))
+    return out
+
+
+def _max_available_short_side(hit: dict[str, Any]) -> int:
+    """Highest short-side among Pixabay streams that have a real URL."""
+    best = 0
+    for _key, raw in _iter_stream_dicts(hit):
+        url = str(raw.get("url") or "").strip()
+        width = _safe_int(raw.get("width"))
+        height = _safe_int(raw.get("height"))
+        if not url or width <= 0 or height <= 0:
+            continue
+        best = max(best, min(width, height))
+    return best
+
+
+def _is_sd_only_video(hit: dict[str, Any]) -> bool:
+    """True when the asset's best available rendition is below HD (Pixabay SD)."""
+    return _max_available_short_side(hit) < MIN_SHORT_SIDE
+
+
+def _best_nine_sixteen_stream(hit: dict[str, Any]) -> PixabayStream | None:
+    """Pick the highest-res 9:16 HD/4K stream (prefers ``large``/4K when present)."""
+    candidates: list[PixabayStream] = []
     videos = hit.get("videos")
     if not isinstance(videos, dict):
         return None
 
-    candidates: list[PixabayStream] = []
     for key in STREAM_KEYS:
         raw = videos.get(key)
         if not isinstance(raw, dict):
@@ -205,6 +241,7 @@ def _best_nine_sixteen_hd_stream(hit: dict[str, Any]) -> PixabayStream | None:
     if not candidates:
         return None
 
+    # Prefer 4K (large) over HD (medium) by pixel count, then file size.
     return max(candidates, key=lambda s: (s.width * s.height, s.size))
 
 
