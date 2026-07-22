@@ -55,7 +55,7 @@ MENU_TEXT = (
     "Available commands:\n"
     "/twitter — download an X/Twitter video, generate Shorts metadata, then publish\n"
     "/hugging_face — generate an AI Short for Midnight Souls, then review & publish\n"
-    "/pixabay — fetch a vertical HD Pixabay Short for Midnight Souls, then review & publish"
+    "/pixabay — fetch a 9:16 HD Pixabay Short for Midnight Souls, then review & publish"
 )
 
 MAX_PIXABAY_PHRASE_ATTEMPTS = 3
@@ -226,7 +226,7 @@ async def pixabay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     session_store.set_chat_flow(message.chat_id, ChatFlow.PIXABAY)
     await message.reply_text(
         "Ready to fetch a Midnight Souls Pixabay Short.\n\n"
-        "Gemini will invent a phrase of the day, then I will download a vertical HD "
+        "Gemini will invent a phrase of the day, then I will download a 9:16 HD "
         "video (≤60s, original quality) for review before publishing.\n\n"
         "Tap Start to begin, or Back to menu if this was a misclick.",
         reply_markup=_build_pixabay_confirm_keyboard(),
@@ -479,7 +479,7 @@ async def _run_pixabay_generation(
                 phrase = await asyncio.to_thread(gemini_client.generate_pixabay_phrase)
 
             await status_msg.edit_text(
-                f"Searching Pixabay for vertical HD video:\n{phrase}"
+                f"Searching Pixabay for 9:16 HD video:\n{phrase}"
             )
             try:
                 result = await asyncio.to_thread(
@@ -498,7 +498,7 @@ async def _run_pixabay_generation(
 
         if result is None:
             raise last_error or PixabayError(
-                "Could not find a suitable vertical HD Pixabay video after several phrases."
+                "Could not find a suitable 9:16 HD Pixabay video after several phrases."
             )
 
         video_path = result.local_path

@@ -1,4 +1,4 @@
-"""Pixabay Video API search + lossless download of vertical HD clips."""
+"""Pixabay Video API search + lossless download of 9:16 Shorts HD clips."""
 
 from __future__ import annotations
 
@@ -21,6 +21,13 @@ CACHE_TTL_SECONDS = 24 * 60 * 60
 MIN_DURATION_SECONDS = 1
 MAX_DURATION_SECONDS = 60
 MIN_SHORT_SIDE = 720
+# YouTube Shorts target: width:height = 9:16  →  height/width = 16/9
+TARGET_ASPECT_HW = 16 / 9
+# Allow tiny codec/rounding drift (e.g. 1080x1918) but reject 3:4 / 4:5 / 2:3.
+ASPECT_RATIO_TOLERANCE = 0.05
+# 720p 9:16 short side → 720x1280
+MIN_WIDTH = 720
+MIN_HEIGHT = 1280
 STREAM_KEYS = ("large", "medium", "small", "tiny")
 USER_AGENT = "YouTubeShortsUploader/1.0"
 
@@ -30,7 +37,7 @@ class PixabayError(Exception):
 
 
 class PixabayExhaustedError(PixabayError):
-    """No unused vertical HD clips left for this phrase (within searched pages)."""
+    """No unused 9:16 HD clips left for this phrase (within searched pages)."""
 
 
 @dataclass(frozen=True)
@@ -70,9 +77,9 @@ def find_and_download_video(
     job_id: str,
     *,
     used_ids: list[int] | None = None,
-    max_pages: int = 2,
+    max_pages: int = 5,
 ) -> PixabayVideoResult:
-    """Search Pixabay and download the next unused vertical HD clip for ``phrase``."""
+    """Search Pixabay and download the next unused 9:16 HD clip for ``phrase``."""
     if not settings.pixabay_api_key:
         raise PixabayError("PIXABAY_API_KEY is not configured.")
 
@@ -97,7 +104,7 @@ def find_and_download_video(
             if video_id in used:
                 continue
 
-            stream = _best_vertical_hd_stream(hit)
+            stream = _best_nine_sixteen_hd_stream(hit)
             if stream is None:
                 continue
 
@@ -117,13 +124,13 @@ def find_and_download_video(
             )
 
     raise PixabayExhaustedError(
-        f"No unused vertical HD Pixabay videos (≤{MAX_DURATION_SECONDS}s) "
+        f"No unused 9:16 HD Pixabay videos (≤{MAX_DURATION_SECONDS}s) "
         f"found for phrase: {cleaned_phrase!r}"
     )
 
 
 def _search_videos(phrase: str, *, page: int) -> dict[str, Any]:
-    cache_key = f"{phrase.casefold()}|page={page}"
+    cache_key = f"{phrase.casefold()}|page={page}|9x16|{MIN_WIDTH}x{MIN_HEIGHT}"
     cached = _search_cache.get(cache_key)
     now = time.time()
     if cached and now - cached[0] < CACHE_TTL_SECONDS:
@@ -133,12 +140,12 @@ def _search_videos(phrase: str, *, page: int) -> dict[str, Any]:
         {
             "key": settings.pixabay_api_key,
             "q": phrase,
-            "video_type": "film",
             "safesearch": "true",
+            # Helps when supported; Videos API may ignore this — client still enforces 9:16.
             "orientation": "vertical",
             "order": "latest",
-            "min_width": 720,
-            "min_height": 720,
+            "min_width": MIN_WIDTH,
+            "min_height": MIN_HEIGHT,
             "per_page": 50,
             "page": page,
         }
@@ -166,7 +173,14 @@ def _search_videos(phrase: str, *, page: int) -> dict[str, Any]:
     return payload
 
 
-def _best_vertical_hd_stream(hit: dict[str, Any]) -> PixabayStream | None:
+def _is_nine_sixteen(width: int, height: int) -> bool:
+    """True when dimensions match YouTube Shorts 9:16 (portrait) within tolerance."""
+    if width <= 0 or height <= width:
+        return False
+    return abs((height / width) - TARGET_ASPECT_HW) <= ASPECT_RATIO_TOLERANCE
+
+
+def _best_nine_sixteen_hd_stream(hit: dict[str, Any]) -> PixabayStream | None:
     videos = hit.get("videos")
     if not isinstance(videos, dict):
         return None
@@ -182,7 +196,7 @@ def _best_vertical_hd_stream(hit: dict[str, Any]) -> PixabayStream | None:
         size = _safe_int(raw.get("size"))
         if not url or width <= 0 or height <= 0:
             continue
-        if height <= width:
+        if not _is_nine_sixteen(width, height):
             continue
         if min(width, height) < MIN_SHORT_SIDE:
             continue
