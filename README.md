@@ -4,7 +4,7 @@ Telegram bot pipeline for publishing YouTube Shorts. Three flows:
 
 1. **`/twitter`** — download a video from an X/Twitter post, generate metadata with Gemini, review, publish.
 2. **`/hugging_face`** — invent a Midnight Souls scene with Gemini, generate vertical HD video via Hugging Face Inference Providers, review the video, then metadata, publish.
-3. **`/pixabay`** — invent a Midnight Souls search phrase with Gemini, download a vertical HD Pixabay video (≤60s, no re-encode), review video then metadata, publish.
+3. **`/pixabay`** — pick random tags from a predefined library, download a vertical HD Pixabay video (≤60s, no re-encode), review video then metadata, publish.
 
 ## Flows
 
@@ -33,12 +33,12 @@ Telegram bot pipeline for publishing YouTube Shorts. Three flows:
 ### Pixabay (Midnight Souls stock)
 
 1. Admin sends `/pixabay` → confirmation with **Start** / **Back to menu** (safe for misclicks).
-2. **Start** → Gemini invents a Midnight Souls “phrase of the day” search query.
+2. **Start** → bot picks 3–4 random tags from the predefined library as the Pixabay search query.
 3. Pixabay Video API search; bot picks an unused **vertical HD** film clip with duration **1–60s**.
 4. Downloads the highest-resolution vertical stream **as-is** (no ffmpeg re-encode).
 5. Bot sends the video with Pixabay attribution and **Approve** / **Decline** / **Modify**.
 6. **Approve** → Gemini metadata JSON + second review (same as Twitter/HF).
-7. **Modify** (video) → next unused hit for the same phrase; if none left, invent a new phrase.
+7. **Modify** (video) → next unused hit for the same query; if none left, pick a new tag set.
 8. **Decline** at either stage → delete and stop.
 9. **Approve** (metadata) → YouTube upload on the same OAuth channel.
 
@@ -214,6 +214,8 @@ app/
   session_store.py     # In-memory job state
   prompts/
     midnight_souls.py  # Channel brand brief for HF video prompts
+  data/
+    pixabay_tags.py    # Predefined Pixabay search tags
   services/
     twitter_downloader.py
     pixabay_client.py
