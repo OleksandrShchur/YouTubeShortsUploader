@@ -215,7 +215,8 @@ app/
   prompts/
     midnight_souls.py  # Channel brand brief for HF video prompts
   data/
-    pixabay_tags.py    # Predefined Pixabay search tags
+    pixabay_tags.py    # Lazy loader + append helper for Pixabay tags
+    pixabay_tags.txt   # One search tag per line (appendable)
   services/
     twitter_downloader.py
     pixabay_client.py
