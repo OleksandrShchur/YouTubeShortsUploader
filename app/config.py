@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     video_storage_dir: Path = Path("storage/videos")
     session_ttl_hours: int = 24
 
+    hf_token: str = ""
+    hf_video_model: str = "Lightricks/LTX-Video-0.9.8-13B-distilled"
+    hf_i2v_model: str = "Wan-AI/Wan2.2-I2V-A14B"
+    hf_provider: str = "auto"
+    hf_target_duration_seconds: float = 12.0
+
     @property
     def video_storage_path(self) -> Path:
         path = self.video_storage_dir
