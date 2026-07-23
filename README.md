@@ -4,7 +4,7 @@ Telegram bot pipeline for publishing YouTube Shorts. Three flows:
 
 1. **`/twitter`** — download a video from an X/Twitter post, generate metadata with Gemini, review, publish.
 2. **`/hugging_face`** — invent a Midnight Souls scene with Gemini, generate vertical HD video via Hugging Face Inference Providers, review the video, then metadata, publish.
-3. **`/pixabay`** — pick random tags from a predefined library, download a vertical HD Pixabay video (≤60s, no re-encode), review video then metadata, publish.
+3. **`/pixabay`** — pick 3 random tags, download a vertical HD Pixabay video, scrape matching Pixabay Music, mux audio trimmed to the video length, review video then metadata, publish.
 
 ## Flows
 
@@ -33,19 +33,24 @@ Telegram bot pipeline for publishing YouTube Shorts. Three flows:
 ### Pixabay (Midnight Souls stock)
 
 1. Admin sends `/pixabay` → confirmation with **Start** / **Back to menu** (safe for misclicks).
-2. **Start** → bot picks 3–4 random tags from the predefined library as the Pixabay search query.
+2. **Start** → bot picks **exactly 3** random tags from the predefined library as the search query.
 3. Pixabay Video API search; bot picks an unused **vertical HD** film clip with duration **1–60s**.
-4. Downloads the highest-resolution vertical stream **as-is** (no ffmpeg re-encode).
-5. Bot sends the video with Pixabay attribution and **Approve** / **Decline** / **Modify**.
-6. **Approve** → Gemini metadata JSON + second review (same as Twitter/HF).
-7. **Modify** (video) → next unused hit for the same query; if none left, pick a new tag set.
-8. **Decline** at either stage → delete and stop.
-9. **Approve** (metadata) → YouTube upload on the same OAuth channel.
+4. Downloads the highest-resolution vertical stream **as-is** (no re-encode) to a silent sidecar file.
+5. Unofficial Pixabay Music scrape with the **same 3 tags**; downloads an MP3 whose duration is at least the video length.
+6. ffmpeg muxes audio onto the video, trimming audio to **exactly** the video duration.
+7. Bot sends the muxed Short with video + music attribution and four buttons:
+   - **Approve** → Gemini metadata JSON + second review (same as Twitter/HF).
+   - **Decline** → delete and stop.
+   - **Modify audio** → keep the silent video + same tags; fetch a different unused track and remux.
+   - **Modify video** → new 3-tag set → new video + new music.
+8. **Approve** (metadata) → YouTube upload on the same OAuth channel.
+
+> Music is **not** covered by the official Pixabay API. The bot scrapes Pixabay Music HTML/CDN links. This can break if Pixabay or Cloudflare changes.
 
 ## Requirements
 
 - Python 3.12+
-- [ffmpeg](https://ffmpeg.org/) (yt-dlp merge + HF clip merge/normalize)
+- [ffmpeg](https://ffmpeg.org/) (yt-dlp merge + HF clip merge/normalize + Pixabay audio mux)
 - Telegram bot token
 - Gemini API key (Google AI Studio)
 - Hugging Face token with Inference Providers permission (`HF_TOKEN`) — for `/hugging_face`
@@ -220,6 +225,7 @@ app/
   services/
     twitter_downloader.py
     pixabay_client.py
+    pixabay_audio_client.py  # Unofficial Music HTML/CDN scrape
     gemini_client.py
     huggingface_video.py
     video_pipeline.py
@@ -240,6 +246,6 @@ entrypoint.sh
 - Session state is in-memory only; restarting the server clears pending jobs.
 - Stale pending sessions and videos older than `SESSION_TTL_HOURS` are cleaned on startup.
 - Starting a new Twitter, HF, or Pixabay job clears leftover files in `storage/videos/`.
-- Pixabay videos are downloaded without re-encoding to preserve quality; only already-vertical HD clips are used.
+- Pixabay videos are downloaded without re-encoding to preserve quality; only already-vertical HD clips are used. Music is scraped unofficially and muxed with ffmpeg (audio trimmed to video length).
 - Default YouTube privacy is `private`; change `YOUTUBE_PRIVACY_STATUS` to `public` or `unlisted` if needed.
 - Hugging Face free-tier clips are often short; the pipeline merges 2–4 continuity clips to reach 8–15 seconds.

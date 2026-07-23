@@ -85,6 +85,7 @@ class JobSession(BaseModel):
     video_prompts: Optional[dict[str, Any]] = None
     pixabay_phrase: Optional[str] = None
     pixabay_used_ids: list[int] = Field(default_factory=list)
+    pixabay_used_audio_ids: list[int] = Field(default_factory=list)
     pixabay_meta: Optional[dict[str, Any]] = None
     created_at: float
     updated_at: float

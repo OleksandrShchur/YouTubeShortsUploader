@@ -166,6 +166,57 @@ def concat_videos(clip_paths: list[Path], output_path: Path) -> Path:
     return output_path
 
 
+def mux_audio_onto_video(
+    video_path: Path,
+    audio_path: Path,
+    output_path: Path,
+) -> Path:
+    """Copy video stream and attach audio trimmed to exactly the video duration."""
+    _require_binaries()
+    if not video_path.exists():
+        raise FFmpegError(f"Video file missing: {video_path}")
+    if not audio_path.exists():
+        raise FFmpegError(f"Audio file missing: {audio_path}")
+
+    duration = probe_duration_seconds(video_path)
+    if duration <= 0:
+        raise FFmpegError(f"Invalid video duration for mux: {duration}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        output_path.unlink()
+
+    _run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-i",
+            str(audio_path),
+            "-t",
+            f"{duration:.3f}",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ],
+        error_prefix="Failed to mux audio onto video",
+    )
+    if not output_path.exists():
+        raise FFmpegError(f"Muxed video was not written: {output_path}")
+    return output_path
+
+
 def ensure_duration_window(
     video_path: Path,
     *,

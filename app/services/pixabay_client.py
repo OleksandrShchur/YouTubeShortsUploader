@@ -80,6 +80,7 @@ def find_and_download_video(
     *,
     used_ids: list[int] | None = None,
     max_pages: int = 5,
+    filename: str | None = None,
 ) -> PixabayVideoResult:
     """Search Pixabay and download the next unused 9:16 HD/4K clip for ``phrase``."""
     if not settings.pixabay_api_key:
@@ -117,7 +118,9 @@ def find_and_download_video(
             if not (MIN_DURATION_SECONDS <= duration <= MAX_DURATION_SECONDS):
                 continue
 
-            local_path = _download_stream(stream.url, output_dir, job_id)
+            local_path = _download_stream(
+                stream.url, output_dir, job_id, filename=filename
+            )
             return PixabayVideoResult(
                 video_id=video_id,
                 page_url=str(hit.get("pageURL") or ""),
@@ -245,9 +248,11 @@ def _best_nine_sixteen_stream(hit: dict[str, Any]) -> PixabayStream | None:
     return max(candidates, key=lambda s: (s.width * s.height, s.size))
 
 
-def _download_stream(url: str, output_dir: Path, job_id: str) -> Path:
+def _download_stream(
+    url: str, output_dir: Path, job_id: str, *, filename: str | None = None
+) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    destination = output_dir / f"{job_id}.mp4"
+    destination = output_dir / (filename or f"{job_id}.mp4")
     if destination.exists():
         destination.unlink()
 
