@@ -66,13 +66,9 @@ def append_pixabay_search_tag(tag: str) -> bool:
 
 
 def pick_pixabay_search_query(rng: Random | None = None) -> str:
-    """Return a Pixabay ``q`` string from 3–4 randomly sampled tags."""
+    """Return a Pixabay ``q`` string from exactly 3 randomly sampled tags."""
     tags = load_pixabay_search_tags()
     picker = rng if rng is not None else random
-    if len(tags) >= 4:
-        count = picker.choice((3, 4))
-    else:
-        count = len(tags)
-
+    count = min(3, len(tags))
     selected = picker.sample(tags, k=count)
     return " ".join(selected)
