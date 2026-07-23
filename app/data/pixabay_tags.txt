@@ -1,6 +1,34 @@
-cozy rain
-misty forest
+rain
+forest
 fireplace
-soft candlelight
-ocean waves
-night city window
+candlelight
+ocean
+waves
+night
+city
+window
+ai generated
+lake
+tree
+sky
+flowers
+mountain
+spring
+summer
+nature
+landscape
+coffee
+cups
+sunrise
+sunset
+spain
+stars
+bay
+travel
+vacation
+tourism
+skyscraper
+drone
+horse
+car
+bridge
