@@ -16,6 +16,7 @@ from telegram.ext import (
 )
 
 from app.config import settings
+from app.data.pixabay_tags import pick_pixabay_search_query
 from app.schemas import (
     ChatFlow,
     JobMode,
@@ -55,7 +56,7 @@ MENU_TEXT = (
     "Available commands:\n"
     "/twitter — download an X/Twitter video, generate Shorts metadata, then publish\n"
     "/hugging_face — generate an AI Short for Midnight Souls, then review & publish\n"
-    "/pixabay — fetch a 9:16 HD Pixabay Short for Midnight Souls, then review & publish"
+    "/pixabay — fetch a 9:16 HD/4K Pixabay Short for Midnight Souls, then review & publish"
 )
 
 MAX_PIXABAY_PHRASE_ATTEMPTS = 3
@@ -226,7 +227,7 @@ async def pixabay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     session_store.set_chat_flow(message.chat_id, ChatFlow.PIXABAY)
     await message.reply_text(
         "Ready to fetch a Midnight Souls Pixabay Short.\n\n"
-        "Gemini will invent a phrase of the day, then I will download a 9:16 HD "
+        "I will pick 3–4 tags from the library, then download a 9:16 HD/4K "
         "video (≤60s, original quality) for review before publishing.\n\n"
         "Tap Start to begin, or Back to menu if this was a misclick.",
         reply_markup=_build_pixabay_confirm_keyboard(),
@@ -427,7 +428,7 @@ def _pixabay_review_caption(result: PixabayVideoResult) -> str:
         f"Phrase: {result.phrase}\n"
         f"{result.attribution}\n\n"
         "Approve → generate title/description with Gemini\n"
-        "Modify → next video (same phrase, or new phrase if exhausted)\n"
+        "Modify → next video (same query, or new tags if exhausted)\n"
         "Decline → discard"
     )
 
@@ -473,13 +474,13 @@ async def _run_pixabay_generation(
         for attempt in range(1, MAX_PIXABAY_PHRASE_ATTEMPTS + 1):
             if not phrase:
                 await status_msg.edit_text(
-                    f"Inventing Midnight Souls phrase of the day with Gemini "
+                    f"Picking Pixabay search tags "
                     f"(attempt {attempt}/{MAX_PIXABAY_PHRASE_ATTEMPTS})..."
                 )
-                phrase = await asyncio.to_thread(gemini_client.generate_pixabay_phrase)
+                phrase = pick_pixabay_search_query()
 
             await status_msg.edit_text(
-                f"Searching Pixabay for 9:16 HD video:\n{phrase}"
+                f"Searching Pixabay for 9:16 HD/4K video:\n{phrase}"
             )
             try:
                 result = await asyncio.to_thread(
@@ -498,7 +499,7 @@ async def _run_pixabay_generation(
 
         if result is None:
             raise last_error or PixabayError(
-                "Could not find a suitable 9:16 HD Pixabay video after several phrases."
+                "Could not find a suitable 9:16 HD/4K Pixabay video after several tag sets."
             )
 
         video_path = result.local_path
@@ -528,12 +529,12 @@ async def _run_pixabay_generation(
             status_msg,
             caption=_pixabay_review_caption(result),
         )
-    except GeminiMetadataError as exc:
+    except ValueError as exc:
         if job_id:
             discard_job(job_id)
         elif video_path:
             delete_video_file(video_path)
-        await status_msg.edit_text(f"Gemini phrase generation failed: {exc}")
+        await status_msg.edit_text(f"Pixabay tag library error: {exc}")
         await message.reply_text(MENU_TEXT)
     except PixabayError as exc:
         if job_id:

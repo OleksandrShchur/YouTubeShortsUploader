@@ -9,7 +9,7 @@ from google.genai import errors as genai_errors
 from google.genai import types
 
 from app.config import settings
-from app.prompts.midnight_souls import BRAND_BRIEF, CHANNEL_NAME, DEFAULT_NEGATIVE_PROMPT, VIDEO_PROMPT_SYSTEM
+from app.prompts.midnight_souls import DEFAULT_NEGATIVE_PROMPT, VIDEO_PROMPT_SYSTEM
 from app.schemas import ShortsMetadata, VideoClipPrompt, VideoPromptPlan
 from app.utils.metadata_rules import normalize_metadata
 
@@ -36,21 +36,6 @@ Rules:
 - return JSON only
 """
 
-PIXABAY_PHRASE_PROMPT = f"""You invent a single stock-video search phrase for the YouTube channel {CHANNEL_NAME}.
-
-{BRAND_BRIEF}
-
-Return ONLY the search phrase as plain text (no quotes, no markdown, no JSON).
-
-Rules:
-- One short English phrase suitable for Pixabay video search (at most 4 words). Start with CURRENT season name (eg "summer", "winter", "spring", "fall").
-- Example style: summer sea waves.
-- Prefer cozy ambient / nature / rain / fireplace / misty forest / study nook / soft interior scenes.
-- Avoid celebrity names, brands, logos, text overlays, faces looking at camera, neon cyberpunk.
-- Do not include hashtags or punctuation fluff.
-- Invent a fresh phrase each time.
-"""
-
 
 class GeminiMetadataError(Exception):
     pass
@@ -59,25 +44,6 @@ class GeminiMetadataError(Exception):
 class GeminiMetadataClient:
     def __init__(self) -> None:
         self._client = genai.Client(api_key=settings.gemini_api_key)
-
-    def generate_pixabay_phrase(self) -> str:
-        try:
-            response = self._client.models.generate_content(
-                model=settings.gemini_model,
-                contents=[
-                    PIXABAY_PHRASE_PROMPT,
-                    "Invent today's Midnight Souls Pixabay search phrase.",
-                ],
-                config=types.GenerateContentConfig(temperature=0.95),
-            )
-        except genai_errors.ClientError as exc:
-            raise self._map_client_error(exc) from exc
-
-        raw_text = (response.text or "").strip()
-        phrase = _normalize_pixabay_phrase(raw_text)
-        if not phrase:
-            raise GeminiMetadataError("Gemini returned an empty Pixabay search phrase.")
-        return phrase
 
     def generate_video_prompts(
         self,
@@ -169,33 +135,6 @@ class GeminiMetadataClient:
                 "or try a different model in GEMINI_MODEL (e.g. gemini-3.5-flash)."
             )
         return GeminiMetadataError(f"Gemini API error ({status_code}): {exc}")
-
-
-def _normalize_pixabay_phrase(text: str) -> str:
-    cleaned = text.strip()
-    fence_match = re.search(r"```(?:\w+)?\s*([\s\S]*?)\s*```", cleaned)
-    if fence_match:
-        cleaned = fence_match.group(1).strip()
-
-    # Prefer a JSON {"phrase": "..."} if the model ignored plain-text instructions.
-    if cleaned.startswith("{"):
-        try:
-            payload = json.loads(cleaned)
-            if isinstance(payload, dict):
-                for key in ("phrase", "q", "query", "search"):
-                    value = payload.get(key)
-                    if value:
-                        cleaned = str(value).strip()
-                        break
-        except json.JSONDecodeError:
-            pass
-
-    cleaned = cleaned.strip().strip('"').strip("'")
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    words = cleaned.split()
-    if len(words) > 4:
-        cleaned = " ".join(words[:4])
-    return cleaned
 
 
 def _parse_json_response(text: str) -> dict:
