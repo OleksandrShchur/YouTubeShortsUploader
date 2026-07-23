@@ -473,6 +473,20 @@ def _pixabay_review_caption(
     )
 
 
+def _cleanup_pixabay_in_progress(
+    job_id: str,
+    *,
+    silent_path: Path | None = None,
+    audio_path: Path | None = None,
+    video_path: Path | None = None,
+) -> None:
+    """Best-effort wipe of any mid-flow Pixabay downloads that may not be in session meta yet."""
+    for path in (silent_path, audio_path, video_path):
+        if path:
+            delete_video_file(path)
+    delete_pixabay_job_files(job_id, settings.video_storage_path)
+
+
 async def _run_pixabay_generation(
     message,
     *,
@@ -486,6 +500,7 @@ async def _run_pixabay_generation(
     used_audio_ids: list[int] = []
     phrase: str | None = None
     silent_path: Path | None = None
+    audio_result: PixabayAudioResult | None = None
 
     try:
         if existing_job_id:
@@ -633,13 +648,9 @@ async def _run_pixabay_generation(
 
             # Modify video: force new tags and replace silent/audio/muxed assets.
             phrase = None
-            if session.video_path:
-                delete_video_file(session.video_path)
-            if silent_path:
-                delete_video_file(silent_path)
-            if meta.get("audio_path"):
-                delete_video_file(str(meta["audio_path"]))
+            delete_pixabay_job_files(job_id, settings.video_storage_path)
             silent_path = None
+            audio_result = None
         else:
             clear_video_storage_dir(settings.video_storage_path)
             pending_path = str(settings.video_storage_path / f"{job_id}.pending")
@@ -652,7 +663,6 @@ async def _run_pixabay_generation(
             )
 
         video_result: PixabayVideoResult | None = None
-        audio_result: PixabayAudioResult | None = None
         last_error: Exception | None = None
 
         for attempt in range(1, MAX_PIXABAY_PHRASE_ATTEMPTS + 1):
@@ -706,8 +716,16 @@ async def _run_pixabay_generation(
                 delete_video_file(silent_path)
                 silent_path = None
                 video_result = None
+                audio_result = None
                 phrase = None
                 continue
+            except PixabayAudioError:
+                # Non-exhausted audio failure: drop the silent clip before bubbling up.
+                delete_video_file(silent_path)
+                silent_path = None
+                video_result = None
+                audio_result = None
+                raise
 
         if video_result is None or audio_result is None or silent_path is None:
             raise last_error or PixabayError(
@@ -766,10 +784,13 @@ async def _run_pixabay_generation(
             session_store.set_mode(existing_job_id, JobMode.AWAITING_URL)
             await status_msg.edit_text(f"Pixabay tag library error: {exc}")
             return
-        if job_id:
-            discard_job(job_id)
-        elif video_path:
-            delete_video_file(video_path)
+        _cleanup_pixabay_in_progress(
+            job_id,
+            silent_path=silent_path,
+            audio_path=audio_result.local_path if audio_result else None,
+            video_path=video_path,
+        )
+        discard_job(job_id)
         await status_msg.edit_text(f"Pixabay tag library error: {exc}")
         await message.reply_text(MENU_TEXT)
     except (PixabayError, PixabayAudioError, FFmpegError) as exc:
@@ -779,10 +800,13 @@ async def _run_pixabay_generation(
             session_store.set_mode(existing_job_id, JobMode.AWAITING_URL)
             await status_msg.edit_text(f"Pixabay audio modify failed: {exc}")
             return
-        if job_id:
-            discard_job(job_id)
-        elif video_path:
-            delete_video_file(video_path)
+        _cleanup_pixabay_in_progress(
+            job_id,
+            silent_path=silent_path,
+            audio_path=audio_result.local_path if audio_result else None,
+            video_path=video_path,
+        )
+        discard_job(job_id)
         await status_msg.edit_text(f"Pixabay fetch failed: {exc}")
         await message.reply_text(MENU_TEXT)
     except Exception:
@@ -795,10 +819,13 @@ async def _run_pixabay_generation(
                 "An unexpected error occurred while modifying Pixabay audio."
             )
             return
-        if job_id:
-            discard_job(job_id)
-        elif video_path:
-            delete_video_file(video_path)
+        _cleanup_pixabay_in_progress(
+            job_id,
+            silent_path=silent_path,
+            audio_path=audio_result.local_path if audio_result else None,
+            video_path=video_path,
+        )
+        discard_job(job_id)
         await status_msg.edit_text("An unexpected error occurred during Pixabay fetch.")
         await message.reply_text(MENU_TEXT)
 

@@ -6,7 +6,7 @@ from fastapi import FastAPI
 
 from app.bot import create_telegram_application
 from app.config import settings
-from app.services.cleanup import cleanup_stale_sessions
+from app.services.cleanup import cleanup_stale_sessions, clear_video_storage_dir
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,6 +20,11 @@ async def lifespan(app: FastAPI):
     stale_removed = cleanup_stale_sessions(settings.session_ttl_hours * 3600)
     if stale_removed:
         logger.info("Removed %s stale session(s) on startup", stale_removed)
+
+    # Sessions are in-memory; leftover media from a previous process is always orphaned.
+    orphaned = clear_video_storage_dir(settings.video_storage_path)
+    if orphaned:
+        logger.info("Cleared %s orphaned media item(s) on startup", orphaned)
 
     telegram_app = create_telegram_application()
     await telegram_app.initialize()
