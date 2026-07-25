@@ -84,7 +84,7 @@ def clear_video_storage_dir(storage_dir: Path) -> int:
 def cleanup_job_video(job_id: str, storage_dir: Path | None = None) -> None:
     base_dir = storage_dir or settings.video_storage_path
     session = session_store.get(job_id)
-    if session and session.source == JobSource.PIXABAY:
+    if session and session.source in {JobSource.PIXABAY, JobSource.PIXABAY_URL}:
         delete_pixabay_job_files(job_id, base_dir)
         return
     if session and session.video_path:
