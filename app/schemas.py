@@ -21,12 +21,14 @@ class ChatFlow(str, Enum):
     TWITTER = "twitter"
     HUGGING_FACE = "hugging_face"
     PIXABAY = "pixabay"
+    PIXABAY_URL = "pixabay_url"
 
 
 class JobSource(str, Enum):
     TWITTER = "twitter"
     HUGGING_FACE = "huggingface"
     PIXABAY = "pixabay"
+    PIXABAY_URL = "pixabay_url"
 
 
 class ReviewStage(str, Enum):

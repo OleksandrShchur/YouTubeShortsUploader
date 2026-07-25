@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -32,6 +33,11 @@ MIN_HEIGHT = 1280
 # Pixabay renditions: large≈4K, medium≈HD. Omit small/tiny (SD-tier).
 STREAM_KEYS = ("large", "medium")
 USER_AGENT = "YouTubeShortsUploader/1.0"
+# https://pixabay.com/videos/slug-123456/ or .../videos/123456/
+_PIXABAY_VIDEO_ID_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?pixabay\.com/videos/(?:[^/\s?#]*-)?(\d+)/?",
+    re.IGNORECASE,
+)
 
 
 class PixabayError(Exception):
@@ -135,6 +141,122 @@ def find_and_download_video(
         f"No unused 9:16 HD/4K Pixabay videos (≤{MAX_DURATION_SECONDS}s) "
         f"found for phrase: {cleaned_phrase!r}"
     )
+
+
+def parse_pixabay_video_id(url: str) -> int:
+    """Extract numeric video id from a Pixabay video page URL."""
+    text = (url or "").strip()
+    match = _PIXABAY_VIDEO_ID_RE.search(text)
+    if not match:
+        raise PixabayError(
+            "Could not parse a Pixabay video URL. "
+            "Send a link like https://pixabay.com/videos/example-123456/"
+        )
+    return int(match.group(1))
+
+
+def is_pixabay_video_url(text: str) -> bool:
+    return bool(_PIXABAY_VIDEO_ID_RE.search((text or "").strip()))
+
+
+def first_tags_from_hit(hit: dict[str, Any], *, limit: int = 3) -> list[str]:
+    """Return the first ``limit`` non-empty tags from a Pixabay hit."""
+    raw = str(hit.get("tags") or "")
+    tags: list[str] = []
+    for part in raw.split(","):
+        tag = part.strip()
+        if tag and tag not in tags:
+            tags.append(tag)
+        if len(tags) >= limit:
+            break
+    return tags
+
+
+def download_video_by_id(
+    video_id: int,
+    output_dir: Path,
+    job_id: str,
+    *,
+    filename: str | None = None,
+) -> PixabayVideoResult:
+    """Fetch a Pixabay video by id and download its 9:16 HD/4K stream if available."""
+    if not settings.pixabay_api_key:
+        raise PixabayError("PIXABAY_API_KEY is not configured.")
+    if video_id <= 0:
+        raise PixabayError("Pixabay video id must be a positive integer.")
+
+    hit = _fetch_video_by_id(video_id)
+    tags = first_tags_from_hit(hit, limit=3)
+    if not tags:
+        raise PixabayError(
+            f"Pixabay video {video_id} has no tags; cannot search for matching audio."
+        )
+    phrase = " ".join(tags)
+
+    if _is_sd_only_video(hit):
+        raise PixabayError(
+            f"Pixabay video {video_id} has no HD/4K stream (short side ≥{MIN_SHORT_SIDE})."
+        )
+
+    stream = _best_nine_sixteen_stream(hit)
+    if stream is None:
+        raise PixabayError(
+            f"Pixabay video {video_id} has no vertical 9:16 HD/4K stream."
+        )
+
+    duration = _safe_int(hit.get("duration"), default=0)
+    if not (MIN_DURATION_SECONDS <= duration <= MAX_DURATION_SECONDS):
+        raise PixabayError(
+            f"Pixabay video {video_id} duration must be "
+            f"{MIN_DURATION_SECONDS}–{MAX_DURATION_SECONDS}s (got {duration}s)."
+        )
+
+    local_path = _download_stream(stream.url, output_dir, job_id, filename=filename)
+    return PixabayVideoResult(
+        video_id=video_id,
+        page_url=str(hit.get("pageURL") or ""),
+        user=str(hit.get("user") or "unknown"),
+        duration=duration,
+        phrase=phrase,
+        stream=stream,
+        local_path=local_path,
+    )
+
+
+def _fetch_video_by_id(video_id: int) -> dict[str, Any]:
+    params = urllib.parse.urlencode(
+        {
+            "key": settings.pixabay_api_key,
+            "id": video_id,
+        }
+    )
+    url = f"{PIXABAY_VIDEOS_URL}?{params}"
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace") if exc.fp else str(exc)
+        raise PixabayError(f"Pixabay API HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise PixabayError(f"Pixabay API request failed: {exc}") from exc
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise PixabayError("Pixabay API returned invalid JSON.") from exc
+
+    if not isinstance(payload, dict):
+        raise PixabayError("Pixabay API JSON root must be an object.")
+
+    hits = payload.get("hits")
+    if not isinstance(hits, list) or not hits:
+        raise PixabayError(f"No Pixabay video found for id {video_id}.")
+
+    hit = hits[0]
+    if not isinstance(hit, dict):
+        raise PixabayError(f"Pixabay API returned an invalid hit for id {video_id}.")
+    return hit
 
 
 def _search_videos(phrase: str, *, page: int) -> dict[str, Any]:

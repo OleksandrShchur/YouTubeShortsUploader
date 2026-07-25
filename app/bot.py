@@ -44,7 +44,10 @@ from app.services.pixabay_client import (
     PixabayExhaustedError,
     PixabayStream,
     PixabayVideoResult,
+    download_video_by_id,
     find_and_download_video,
+    is_pixabay_video_url,
+    parse_pixabay_video_id,
 )
 from app.services.twitter_downloader import TwitterDownloadError, download_twitter_video
 from app.services.video_pipeline import HuggingFaceVideoPipeline, VideoPipelineError
@@ -71,7 +74,8 @@ MENU_TEXT = (
     "Available commands:\n"
     "/twitter — download an X/Twitter video, generate Shorts metadata, then publish\n"
     "/hugging_face — generate an AI Short for Midnight Souls, then review & publish\n"
-    "/pixabay — fetch a 9:16 HD/4K Pixabay Short for Midnight Souls, then review & publish"
+    "/pixabay — fetch a 9:16 HD/4K Pixabay Short for Midnight Souls, then review & publish\n"
+    "/pixabay_url — paste a Pixabay video URL, add music, then review & publish"
 )
 
 MAX_PIXABAY_PHRASE_ATTEMPTS = 3
@@ -139,6 +143,35 @@ def _build_pixabay_video_keyboard(job_id: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("Back to menu", callback_data=ACTION_BACK_MENU)],
         ]
     )
+
+
+def _build_pixabay_url_video_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Approve", callback_data=f"{ACTION_APPROVE}:{job_id}"),
+                InlineKeyboardButton("Decline", callback_data=f"{ACTION_DECLINE}:{job_id}"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Change audio", callback_data=f"{ACTION_MODIFY_AUDIO}:{job_id}"
+                ),
+            ],
+            [InlineKeyboardButton("Back to menu", callback_data=ACTION_BACK_MENU)],
+        ]
+    )
+
+
+def _is_pixabay_like(source: JobSource) -> bool:
+    return source in {JobSource.PIXABAY, JobSource.PIXABAY_URL}
+
+
+def _video_keyboard_for_source(source: JobSource, job_id: str) -> InlineKeyboardMarkup:
+    if source == JobSource.PIXABAY_URL:
+        return _build_pixabay_url_video_keyboard(job_id)
+    if source == JobSource.PIXABAY:
+        return _build_pixabay_video_keyboard(job_id)
+    return _build_action_keyboard(job_id)
 
 
 def _has_blocking_job(chat_id: int) -> tuple[bool, str | None]:
@@ -269,6 +302,38 @@ async def pixabay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+async def pixabay_url_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await _reject_unauthorized(update)
+        return
+
+    message = update.effective_message
+    if not message:
+        return
+
+    blocked, reason = _has_blocking_job(message.chat_id)
+    if blocked:
+        await message.reply_text(reason or "A job is already in progress.")
+        return
+
+    if not settings.pixabay_api_key:
+        await message.reply_text(
+            "PIXABAY_API_KEY is not configured. Get a free key at "
+            "https://pixabay.com/api/docs/ (log in to see it), add it to .env, "
+            "then retry /pixabay_url."
+        )
+        return
+
+    session_store.set_chat_flow(message.chat_id, ChatFlow.PIXABAY_URL)
+    await message.reply_text(
+        "Send a Pixabay video page URL (9:16 HD/4K, ≤60s).\n\n"
+        "I will download it, take up to 3 tags from the video, search Pixabay "
+        "Music, mux audio, then ask you to Approve, Change audio, or Decline "
+        "before Gemini metadata and publishing.",
+        reply_markup=_build_back_keyboard(),
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update):
         await _reject_unauthorized(update)
@@ -297,9 +362,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    if session_store.get_chat_flow(message.chat_id) == ChatFlow.PIXABAY_URL:
+        if not is_pixabay_video_url(text):
+            await message.reply_text(
+                "Please send a valid Pixabay video page URL "
+                "(e.g. https://pixabay.com/videos/example-123456/).",
+                reply_markup=_build_back_keyboard(),
+            )
+            return
+        try:
+            parse_pixabay_video_id(text)
+        except PixabayError as exc:
+            await message.reply_text(str(exc), reply_markup=_build_back_keyboard())
+            return
+        await _run_pixabay_url_generation(message, text)
+        return
+
     if session_store.get_chat_flow(message.chat_id) != ChatFlow.TWITTER:
         await message.reply_text(
-            "Use /twitter, /hugging_face, or /pixabay to start a Shorts flow, "
+            "Use /twitter, /hugging_face, /pixabay, or /pixabay_url to start a Shorts flow, "
             "or /start for available commands."
         )
         return
@@ -473,6 +554,21 @@ def _pixabay_review_caption(
     )
 
 
+def _pixabay_url_review_caption(
+    video: PixabayVideoResult,
+    audio: PixabayAudioResult,
+) -> str:
+    return (
+        "Pixabay URL Short (video + audio review):\n"
+        f"Tags: {video.phrase}\n"
+        f"{video.attribution}\n"
+        f"{audio.attribution}\n\n"
+        "Approve → generate title/description with Gemini\n"
+        "Change audio → keep video, fetch different music (same tags)\n"
+        "Decline → discard"
+    )
+
+
 def _cleanup_pixabay_in_progress(
     job_id: str,
     *,
@@ -520,15 +616,21 @@ async def _run_pixabay_generation(
 
             if modify_audio_only:
                 if not silent_path or not silent_path.exists():
-                    await status_msg.edit_text(
-                        "Silent video is missing; cannot modify audio. Try Modify video."
+                    hint = (
+                        "Silent video is missing; cannot change audio."
+                        if session.source == JobSource.PIXABAY_URL
+                        else "Silent video is missing; cannot modify audio. Try Modify video."
                     )
+                    await status_msg.edit_text(hint)
                     session_store.set_mode(job_id, JobMode.AWAITING_URL)
                     return
                 if not phrase:
-                    await status_msg.edit_text(
-                        "Search phrase is missing; cannot modify audio. Try Modify video."
+                    hint = (
+                        "Search tags are missing; cannot change audio."
+                        if session.source == JobSource.PIXABAY_URL
+                        else "Search phrase is missing; cannot modify audio. Try Modify video."
                     )
+                    await status_msg.edit_text(hint)
                     session_store.set_mode(job_id, JobMode.AWAITING_URL)
                     return
 
@@ -635,14 +737,19 @@ async def _run_pixabay_generation(
                     ),
                     local_path=silent_path,
                 )
+                caption_fn = (
+                    _pixabay_url_review_caption
+                    if session.source == JobSource.PIXABAY_URL
+                    else _pixabay_review_caption
+                )
                 await _send_video_review(
                     message,
                     job_id,
                     video_path,
                     phrase,
                     status_msg,
-                    caption=_pixabay_review_caption(caption_video, audio_result),
-                    reply_markup=_build_pixabay_video_keyboard(job_id),
+                    caption=caption_fn(caption_video, audio_result),
+                    reply_markup=_video_keyboard_for_source(session.source, job_id),
                 )
                 return
 
@@ -830,6 +937,123 @@ async def _run_pixabay_generation(
         await message.reply_text(MENU_TEXT)
 
 
+async def _run_pixabay_url_generation(message, pixabay_url: str) -> None:
+    status_msg = await message.reply_text("Starting Pixabay URL Shorts fetch...")
+    job_id = uuid4().hex[:12]
+    video_path: Path | None = None
+    silent_path: Path | None = None
+    audio_result: PixabayAudioResult | None = None
+
+    try:
+        video_id = parse_pixabay_video_id(pixabay_url)
+        clear_video_storage_dir(settings.video_storage_path)
+        pending_path = str(settings.video_storage_path / f"{job_id}.pending")
+        session_store.create_job(
+            message.chat_id,
+            pending_path,
+            job_id=job_id,
+            source=JobSource.PIXABAY_URL,
+            review_stage=ReviewStage.VIDEO,
+        )
+        session_store.set_mode(job_id, JobMode.PROCESSING)
+
+        await status_msg.edit_text(f"Downloading Pixabay video id {video_id}...")
+        video_result = await asyncio.to_thread(
+            download_video_by_id,
+            video_id,
+            settings.video_storage_path,
+            job_id,
+            filename=f"{job_id}_silent.mp4",
+        )
+        silent_path = video_result.local_path
+        phrase = video_result.phrase
+
+        video_duration = await asyncio.to_thread(probe_duration_seconds, silent_path)
+        await status_msg.edit_text(
+            f"Searching Pixabay Music for matching audio:\n{phrase}"
+        )
+        audio_result = await asyncio.to_thread(
+            find_and_download_audio,
+            phrase,
+            settings.video_storage_path,
+            job_id,
+            min_duration_seconds=video_duration,
+        )
+
+        muxed_path = settings.video_storage_path / f"{job_id}.mp4"
+        await status_msg.edit_text("Muxing audio onto video...")
+        video_path = await asyncio.to_thread(
+            mux_audio_onto_video,
+            silent_path,
+            audio_result.local_path,
+            muxed_path,
+        )
+
+        pixabay_meta = {
+            "video_id": video_result.video_id,
+            "page_url": video_result.page_url,
+            "user": video_result.user,
+            "duration": video_result.duration,
+            "width": video_result.stream.width,
+            "height": video_result.stream.height,
+            "silent_path": str(silent_path),
+            "audio_id": audio_result.audio_id,
+            "audio_page_url": audio_result.page_url,
+            "audio_user": audio_result.user,
+            "audio_duration": audio_result.duration,
+            "audio_name": audio_result.name,
+            "audio_path": str(audio_result.local_path),
+        }
+        session_store.update_video(
+            job_id,
+            str(video_path),
+            review_stage=ReviewStage.VIDEO,
+            mode=JobMode.AWAITING_URL,
+            pixabay_phrase=phrase,
+            pixabay_used_ids=[video_result.video_id],
+            pixabay_used_audio_ids=[audio_result.audio_id],
+            pixabay_meta=pixabay_meta,
+        )
+        await _send_video_review(
+            message,
+            job_id,
+            video_path,
+            phrase,
+            status_msg,
+            caption=_pixabay_url_review_caption(video_result, audio_result),
+            reply_markup=_build_pixabay_url_video_keyboard(job_id),
+        )
+    except (PixabayError, PixabayAudioError, FFmpegError) as exc:
+        _cleanup_pixabay_in_progress(
+            job_id,
+            silent_path=silent_path,
+            audio_path=audio_result.local_path if audio_result else None,
+            video_path=video_path,
+        )
+        discard_job(job_id)
+        await status_msg.edit_text(f"Pixabay URL fetch failed: {exc}")
+        await message.reply_text(
+            "Send another Pixabay video URL, or use Back to menu.",
+            reply_markup=_build_back_keyboard(),
+        )
+    except Exception:
+        logger.exception("Unexpected Pixabay URL generation error")
+        _cleanup_pixabay_in_progress(
+            job_id,
+            silent_path=silent_path,
+            audio_path=audio_result.local_path if audio_result else None,
+            video_path=video_path,
+        )
+        discard_job(job_id)
+        await status_msg.edit_text(
+            "An unexpected error occurred while processing the Pixabay URL."
+        )
+        await message.reply_text(
+            "Send another Pixabay video URL, or use Back to menu.",
+            reply_markup=_build_back_keyboard(),
+        )
+
+
 async def _send_video_review(
     message,
     job_id: str,
@@ -984,7 +1208,7 @@ async def _handle_video_stage_action(update: Update, action: str, job_id: str) -
         return
 
     if action == ACTION_DECLINE:
-        if session.source == JobSource.PIXABAY:
+        if _is_pixabay_like(session.source):
             delete_pixabay_job_files(job_id)
         else:
             delete_video_file(session.video_path)
@@ -994,8 +1218,8 @@ async def _handle_video_stage_action(update: Update, action: str, job_id: str) -
         return
 
     if action == ACTION_MODIFY_AUDIO:
-        if session.source != JobSource.PIXABAY:
-            await _edit_callback_message(query, "Modify audio is only available for Pixabay.")
+        if not _is_pixabay_like(session.source):
+            await _edit_callback_message(query, "Change audio is only available for Pixabay.")
             return
         await _edit_callback_message(query, "Fetching different Pixabay music...")
         await _run_pixabay_generation(
@@ -1035,11 +1259,7 @@ async def _handle_video_stage_action(update: Update, action: str, job_id: str) -
             session_store.set_mode(job_id, JobMode.AWAITING_URL)
             await message.reply_text(
                 f"Gemini processing failed: {exc}",
-                reply_markup=(
-                    _build_pixabay_video_keyboard(job_id)
-                    if session.source == JobSource.PIXABAY
-                    else _build_action_keyboard(job_id)
-                ),
+                reply_markup=_video_keyboard_for_source(session.source, job_id),
             )
             return
         except Exception:
@@ -1047,11 +1267,7 @@ async def _handle_video_stage_action(update: Update, action: str, job_id: str) -
             session_store.set_mode(job_id, JobMode.AWAITING_URL)
             await message.reply_text(
                 "An unexpected error occurred while generating metadata.",
-                reply_markup=(
-                    _build_pixabay_video_keyboard(job_id)
-                    if session.source == JobSource.PIXABAY
-                    else _build_action_keyboard(job_id)
-                ),
+                reply_markup=_video_keyboard_for_source(session.source, job_id),
             )
             return
 
@@ -1080,7 +1296,7 @@ async def _handle_metadata_stage_action(update: Update, action: str, job_id: str
         return
 
     if action == ACTION_DECLINE:
-        if session.source == JobSource.PIXABAY:
+        if _is_pixabay_like(session.source):
             delete_pixabay_job_files(job_id)
         else:
             delete_video_file(session.video_path)
@@ -1111,7 +1327,7 @@ async def _handle_metadata_stage_action(update: Update, action: str, job_id: str
 
         video_id = response.get("id", "unknown")
         youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-        if session.source == JobSource.PIXABAY:
+        if _is_pixabay_like(session.source):
             delete_pixabay_job_files(job_id)
         else:
             delete_video_file(session.video_path)
@@ -1208,6 +1424,7 @@ def create_telegram_application() -> Application:
     application.add_handler(CommandHandler("twitter", twitter_command))
     application.add_handler(CommandHandler("hugging_face", hugging_face_command))
     application.add_handler(CommandHandler("pixabay", pixabay_command))
+    application.add_handler(CommandHandler("pixabay_url", pixabay_url_command))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
