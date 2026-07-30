@@ -109,6 +109,7 @@ Edit `.env` with your values. See [Environment variables](#environment-variables
 1. Create a bot with [@BotFather](https://t.me/BotFather).
 2. Put the token in `TELEGRAM_BOT_TOKEN`.
 3. Get your chat ID (message [@userinfobot](https://t.me/userinfobot) or inspect bot updates) and set `ADMIN_CHAT_ID`.
+4. For production, set `TELEGRAM_WEBHOOK_URL` to your public HTTPS base (Telegram pushes updates there). Leave it empty locally to fall back to long polling.
 
 ### 4. Gemini API
 
@@ -145,6 +146,14 @@ For Docker or headless deployment, generate `secrets/youtube_token.json` locally
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+Without `TELEGRAM_WEBHOOK_URL`, the bot uses long polling. For webhook mode locally, expose HTTPS (e.g. ngrok / Cloudflare Tunnel) and set:
+
+```bash
+TELEGRAM_WEBHOOK_URL=https://your-tunnel.example
+TELEGRAM_WEBHOOK_PATH=/telegram/webhook
+TELEGRAM_WEBHOOK_SECRET=a-long-random-string
+```
+
 Health check: `GET http://localhost:8000/health`
 
 ## Docker
@@ -158,7 +167,9 @@ docker run --env-file .env -p 7860:7860 youtube-shorts-uploader
 
 Health check: `GET http://localhost:7860/health`
 
-The container listens on port **7860** and includes ffmpeg. OAuth credential files can be supplied in two ways:
+The container listens on port **7860** and includes ffmpeg. Set `TELEGRAM_WEBHOOK_URL` to the container’s public HTTPS base (for example `https://your-space.hf.space`) so Telegram uses webhooks instead of long polling.
+
+OAuth credential files can be supplied in two ways:
 
 **Option A — bind-mount local secrets:**
 
@@ -185,6 +196,9 @@ The entrypoint writes these variables to `secrets/client_secret.json` and `secre
 |----------|----------|---------|-------------|
 | `TELEGRAM_BOT_TOKEN` | yes | — | Bot token from @BotFather |
 | `ADMIN_CHAT_ID` | yes | — | Telegram chat ID allowed to use the bot |
+| `TELEGRAM_WEBHOOK_URL` | production | — | Public HTTPS base URL; enables webhooks when set |
+| `TELEGRAM_WEBHOOK_PATH` | no | `/telegram/webhook` | Path Telegram POSTs updates to |
+| `TELEGRAM_WEBHOOK_SECRET` | no | — | Shared secret verified via `X-Telegram-Bot-Api-Secret-Token` |
 | `GEMINI_API_KEY` | yes | — | Google AI Studio API key |
 | `GEMINI_MODEL` | no | `gemini-3.5-flash` | Gemini model for prompts/metadata |
 | `HF_TOKEN` | for `/hugging_face` | — | Hugging Face token (Inference Providers) |
@@ -225,7 +239,7 @@ Only the four metadata fields above are required when modifying; `display_title`
 
 ```
 app/
-  main.py              # FastAPI app + Telegram bot lifecycle
+  main.py              # FastAPI app + Telegram webhook/polling lifecycle
   bot.py               # Telegram handlers and review flows
   config.py            # Settings from environment
   schemas.py           # Pydantic models
@@ -255,6 +269,7 @@ entrypoint.sh
 
 ## Notes
 
+- Prefer webhooks in production (`TELEGRAM_WEBHOOK_URL`); long polling is only for local use when that variable is unset.
 - Only the configured `ADMIN_CHAT_ID` can use the bot.
 - Session state is in-memory only; restarting the server clears pending jobs.
 - Stale pending sessions and videos older than `SESSION_TTL_HOURS` are cleaned on startup.
