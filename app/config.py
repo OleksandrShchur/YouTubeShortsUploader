@@ -12,6 +12,11 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str
     admin_chat_id: int
+    # Public HTTPS base URL for Telegram webhooks (e.g. https://example.com).
+    # When unset, the bot falls back to long polling (local development).
+    telegram_webhook_url: str = ""
+    telegram_webhook_path: str = "/telegram/webhook"
+    telegram_webhook_secret: str = ""
 
     gemini_api_key: str
     gemini_model: str = "gemini-3.5-flash"
