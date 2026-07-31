@@ -9,8 +9,7 @@ from google.genai import errors as genai_errors
 from google.genai import types
 
 from app.config import settings
-from app.prompts.midnight_souls import DEFAULT_NEGATIVE_PROMPT, VIDEO_PROMPT_SYSTEM
-from app.schemas import ShortsMetadata, VideoClipPrompt, VideoPromptPlan
+from app.schemas import ShortsMetadata
 from app.utils.metadata_rules import normalize_metadata
 
 logger = logging.getLogger(__name__)
@@ -44,35 +43,6 @@ class GeminiMetadataError(Exception):
 class GeminiMetadataClient:
     def __init__(self) -> None:
         self._client = genai.Client(api_key=settings.gemini_api_key)
-
-    def generate_video_prompts(
-        self,
-        target_duration_seconds: float | None = None,
-    ) -> VideoPromptPlan:
-        duration = target_duration_seconds or settings.hf_target_duration_seconds
-        duration = max(8.0, min(15.0, float(duration)))
-        user_message = (
-            f"Invent a new Midnight Souls Shorts scene. "
-            f"Prefer target_duration_seconds around {duration:.0f}."
-        )
-        try:
-            response = self._client.models.generate_content(
-                model=settings.gemini_model,
-                contents=[VIDEO_PROMPT_SYSTEM, user_message],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.9,
-                ),
-            )
-        except genai_errors.ClientError as exc:
-            raise self._map_client_error(exc) from exc
-
-        raw_text = (response.text or "").strip()
-        if not raw_text:
-            raise GeminiMetadataError("Gemini returned an empty video-prompt response.")
-
-        payload = _parse_json_response(raw_text)
-        return _normalize_video_prompt_plan(payload, preferred_duration=duration)
 
     def generate_metadata(self, video_path: Path) -> ShortsMetadata:
         if not video_path.exists():
@@ -152,65 +122,3 @@ def _parse_json_response(text: str) -> dict:
         raise GeminiMetadataError("Gemini JSON root must be an object.")
     return data
 
-
-def _normalize_video_prompt_plan(
-    payload: dict,
-    preferred_duration: float,
-) -> VideoPromptPlan:
-    clips_raw = payload.get("clips")
-    if not isinstance(clips_raw, list) or not clips_raw:
-        raise GeminiMetadataError("Gemini video prompts must include a non-empty clips list.")
-
-    clips: list[VideoClipPrompt] = []
-    for idx, item in enumerate(clips_raw[:4], start=1):
-        if not isinstance(item, dict):
-            raise GeminiMetadataError("Each clip prompt must be an object.")
-        prompt = str(item.get("prompt") or "").strip()
-        if not prompt:
-            raise GeminiMetadataError(f"Clip {idx} is missing a prompt.")
-        hint = item.get("duration_hint_seconds", preferred_duration / max(len(clips_raw[:4]), 1))
-        try:
-            hint_f = float(hint)
-        except (TypeError, ValueError) as exc:
-            raise GeminiMetadataError(f"Clip {idx} has invalid duration_hint_seconds.") from exc
-        clips.append(
-            VideoClipPrompt(
-                index=int(item.get("index") or idx),
-                duration_hint_seconds=max(1.0, min(15.0, hint_f)),
-                prompt=prompt,
-            )
-        )
-
-    if len(clips) < 2:
-        # Ensure at least 2 clips for merge strategy when free-tier clips are short.
-        first = clips[0]
-        clips.append(
-            VideoClipPrompt(
-                index=2,
-                duration_hint_seconds=first.duration_hint_seconds,
-                prompt=(
-                    f"Seamless continuation of the exact same scene and camera: {first.prompt}. "
-                    "Same lighting, palette, and subject; gentle ongoing ambient motion only."
-                ),
-            )
-        )
-
-    target = payload.get("target_duration_seconds", preferred_duration)
-    try:
-        target_f = float(target)
-    except (TypeError, ValueError):
-        target_f = preferred_duration
-    target_f = max(8.0, min(15.0, target_f))
-
-    negative = str(payload.get("negative_prompt") or DEFAULT_NEGATIVE_PROMPT).strip()
-    if not negative:
-        negative = DEFAULT_NEGATIVE_PROMPT
-
-    scene_summary = str(payload.get("scene_summary") or "Cozy ambient Midnight Souls scene").strip()
-
-    return VideoPromptPlan(
-        scene_summary=scene_summary,
-        target_duration_seconds=target_f,
-        negative_prompt=negative,
-        clips=clips,
-    )

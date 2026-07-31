@@ -50,7 +50,6 @@ from app.services.pixabay_client import (
     parse_pixabay_video_id,
 )
 from app.services.twitter_downloader import TwitterDownloadError, download_twitter_video
-from app.services.video_pipeline import HuggingFaceVideoPipeline, VideoPipelineError
 from app.services.youtube_uploader import YouTubeUploadError, YouTubeUploader
 from app.session_store import session_store
 from app.utils.metadata_rules import (
@@ -73,7 +72,6 @@ ACTION_START_PIXABAY = "start_pixabay"
 MENU_TEXT = (
     "Available commands:\n"
     "/twitter — download an X/Twitter video, generate Shorts metadata, then publish\n"
-    "/hugging_face — generate an AI Short for Midnight Souls, then review & publish\n"
     "/pixabay — fetch a 9:16 HD/4K Pixabay Short for Midnight Souls, then review & publish\n"
     "/pixabay_url — paste a Pixabay video URL, add music, then review & publish"
 )
@@ -82,7 +80,6 @@ MAX_PIXABAY_PHRASE_ATTEMPTS = 3
 
 gemini_client = GeminiMetadataClient()
 youtube_uploader = YouTubeUploader()
-hf_pipeline = HuggingFaceVideoPipeline(gemini_client=gemini_client)
 
 
 def _is_admin(update: Update) -> bool:
@@ -245,31 +242,6 @@ async def twitter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
-async def hugging_face_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update):
-        await _reject_unauthorized(update)
-        return
-
-    message = update.effective_message
-    if not message:
-        return
-
-    blocked, reason = _has_blocking_job(message.chat_id)
-    if blocked:
-        await message.reply_text(reason or "A job is already in progress.")
-        return
-
-    if not settings.hf_token:
-        await message.reply_text(
-            "HF_TOKEN is not configured. Add a Hugging Face token with "
-            "Inference Providers permission to .env, then retry /hugging_face."
-        )
-        return
-
-    session_store.set_chat_flow(message.chat_id, ChatFlow.HUGGING_FACE)
-    await _run_hugging_face_generation(message)
-
-
 async def pixabay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update):
         await _reject_unauthorized(update)
@@ -380,7 +352,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if session_store.get_chat_flow(message.chat_id) != ChatFlow.TWITTER:
         await message.reply_text(
-            "Use /twitter, /hugging_face, /pixabay, or /pixabay_url to start a Shorts flow, "
+            "Use /twitter, /pixabay, or /pixabay_url to start a Shorts flow, "
             "or /start for available commands."
         )
         return
@@ -451,91 +423,6 @@ async def _process_new_url(update: Update, twitter_url: str) -> None:
         elif video_path:
             delete_video_file(video_path)
         await status_msg.edit_text("An unexpected error occurred while processing the URL.")
-
-
-async def _run_hugging_face_generation(message, *, existing_job_id: str | None = None) -> None:
-    status_msg = await message.reply_text("Starting Hugging Face Shorts generation...")
-    job_id = existing_job_id or uuid4().hex[:12]
-    video_path: Path | None = None
-
-    loop = asyncio.get_running_loop()
-    progress_queue: asyncio.Queue[str | None] = asyncio.Queue()
-
-    def on_progress(text: str) -> None:
-        loop.call_soon_threadsafe(progress_queue.put_nowait, text)
-
-    async def drain_progress() -> None:
-        while True:
-            item = await progress_queue.get()
-            if item is None:
-                break
-            try:
-                await status_msg.edit_text(item)
-            except Exception:
-                logger.debug("Could not edit progress message", exc_info=True)
-
-    progress_task = asyncio.create_task(drain_progress())
-
-    try:
-        if existing_job_id:
-            session = session_store.get(existing_job_id)
-            if not session:
-                await progress_queue.put(None)
-                await progress_task
-                await status_msg.edit_text("This job no longer exists.")
-                await message.reply_text(MENU_TEXT)
-                return
-            if session.video_path:
-                delete_video_file(session.video_path)
-            session_store.set_mode(job_id, JobMode.PROCESSING)
-            session_store.set_review_stage(job_id, ReviewStage.VIDEO)
-        else:
-            clear_video_storage_dir(settings.video_storage_path)
-            pending_path = str(settings.video_storage_path / f"{job_id}.pending")
-            session_store.create_job(
-                message.chat_id,
-                pending_path,
-                job_id=job_id,
-                source=JobSource.HUGGING_FACE,
-                review_stage=ReviewStage.VIDEO,
-            )
-
-        video_path, plan = await asyncio.to_thread(
-            hf_pipeline.generate,
-            settings.video_storage_path,
-            job_id,
-            on_progress=on_progress,
-        )
-        await progress_queue.put(None)
-        await progress_task
-
-        session_store.update_video(
-            job_id,
-            str(video_path),
-            video_prompts=plan.model_dump(),
-            review_stage=ReviewStage.VIDEO,
-            mode=JobMode.AWAITING_URL,
-        )
-        await _send_video_review(message, job_id, video_path, plan.scene_summary, status_msg)
-    except VideoPipelineError as exc:
-        await progress_queue.put(None)
-        await progress_task
-        if job_id:
-            discard_job(job_id)
-        elif video_path:
-            delete_video_file(video_path)
-        await status_msg.edit_text(f"Hugging Face generation failed: {exc}")
-        await message.reply_text(MENU_TEXT)
-    except Exception:
-        logger.exception("Unexpected Hugging Face generation error")
-        await progress_queue.put(None)
-        await progress_task
-        if job_id:
-            discard_job(job_id)
-        elif video_path:
-            delete_video_file(video_path)
-        await status_msg.edit_text("An unexpected error occurred during video generation.")
-        await message.reply_text(MENU_TEXT)
 
 
 def _pixabay_review_caption(
@@ -1241,8 +1128,7 @@ async def _handle_video_stage_action(update: Update, action: str, job_id: str) -
             await _edit_callback_message(query, "Fetching another Pixabay video + audio...")
             await _run_pixabay_generation(message, existing_job_id=job_id)
             return
-        await _edit_callback_message(query, "Regenerating a new video...")
-        await _run_hugging_face_generation(message, existing_job_id=job_id)
+        await _edit_callback_message(query, "Modify video is only available for Pixabay.")
         return
 
     if action == ACTION_APPROVE:
@@ -1422,7 +1308,6 @@ def create_telegram_application(*, use_webhook: bool = False) -> Application:
     application = builder.build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("twitter", twitter_command))
-    application.add_handler(CommandHandler("hugging_face", hugging_face_command))
     application.add_handler(CommandHandler("pixabay", pixabay_command))
     application.add_handler(CommandHandler("pixabay_url", pixabay_url_command))
     application.add_handler(
