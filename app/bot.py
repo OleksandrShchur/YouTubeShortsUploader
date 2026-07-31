@@ -1414,12 +1414,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _handle_metadata_stage_action(update, action, job_id)
 
 
-def create_telegram_application() -> Application:
-    application = (
-        Application.builder()
-        .token(settings.telegram_bot_token)
-        .build()
-    )
+def create_telegram_application(*, use_webhook: bool = False) -> Application:
+    builder = Application.builder().token(settings.telegram_bot_token)
+    if use_webhook:
+        # Custom FastAPI route feeds updates; no built-in Updater/polling loop.
+        builder = builder.updater(None)
+    application = builder.build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("twitter", twitter_command))
     application.add_handler(CommandHandler("hugging_face", hugging_face_command))

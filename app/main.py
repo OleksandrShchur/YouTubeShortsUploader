@@ -1,8 +1,9 @@
-import asyncio
 import logging
 from contextlib import asynccontextmanager
+from http import HTTPStatus
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException, Request, Response
+from telegram import Update
 
 from app.bot import create_telegram_application
 from app.config import settings
@@ -13,6 +14,19 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _webhook_enabled() -> bool:
+    return bool(settings.telegram_webhook_url.strip())
+
+
+def _webhook_path() -> str:
+    path = settings.telegram_webhook_path.strip() or "/telegram/webhook"
+    return path if path.startswith("/") else f"/{path}"
+
+
+def _webhook_url() -> str:
+    return f"{settings.telegram_webhook_url.rstrip('/')}{_webhook_path()}"
 
 
 @asynccontextmanager
@@ -26,16 +40,38 @@ async def lifespan(app: FastAPI):
     if orphaned:
         logger.info("Cleared %s orphaned media item(s) on startup", orphaned)
 
-    telegram_app = create_telegram_application()
+    use_webhook = _webhook_enabled()
+    telegram_app = create_telegram_application(use_webhook=use_webhook)
+    app.state.telegram_app = telegram_app
+
     await telegram_app.initialize()
     await telegram_app.start()
-    await telegram_app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Telegram bot started")
+
+    if use_webhook:
+        webhook_url = _webhook_url()
+        webhook_kwargs: dict = {
+            "url": webhook_url,
+            "allowed_updates": Update.ALL_TYPES,
+            "drop_pending_updates": True,
+        }
+        secret = settings.telegram_webhook_secret.strip()
+        if secret:
+            webhook_kwargs["secret_token"] = secret
+        await telegram_app.bot.set_webhook(**webhook_kwargs)
+        logger.info("Telegram bot started (webhook: %s)", webhook_url)
+    else:
+        await telegram_app.updater.start_polling(drop_pending_updates=True)
+        logger.info(
+            "Telegram bot started (long polling; set TELEGRAM_WEBHOOK_URL to use webhooks)"
+        )
 
     try:
         yield
     finally:
-        await telegram_app.updater.stop()
+        if use_webhook:
+            await telegram_app.bot.delete_webhook()
+        elif telegram_app.updater is not None:
+            await telegram_app.updater.stop()
         await telegram_app.stop()
         await telegram_app.shutdown()
         logger.info("Telegram bot stopped")
@@ -51,6 +87,39 @@ app = FastAPI(
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+) -> Response:
+    """Receive Telegram updates pushed to the configured webhook URL."""
+    if not _webhook_enabled():
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND,
+            detail="Webhook mode is disabled",
+        )
+
+    expected_secret = settings.telegram_webhook_secret.strip()
+    if expected_secret and x_telegram_bot_api_secret_token != expected_secret:
+        raise HTTPException(
+            status_code=HTTPStatus.FORBIDDEN,
+            detail="Invalid secret token",
+        )
+
+    telegram_app = request.app.state.telegram_app
+    data = await request.json()
+    update = Update.de_json(data=data, bot=telegram_app.bot)
+    await telegram_app.update_queue.put(update)
+    return Response(status_code=HTTPStatus.OK)
+
+
+app.add_api_route(
+    _webhook_path(),
+    telegram_webhook,
+    methods=["POST"],
+    name="telegram_webhook",
+)
 
 
 if __name__ == "__main__":
