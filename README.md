@@ -1,11 +1,10 @@
 # YouTube Shorts Uploader
 
-Telegram bot pipeline for publishing YouTube Shorts. Four flows:
+Telegram bot pipeline for publishing YouTube Shorts. Three flows:
 
 1. **`/twitter`** — download a video from an X/Twitter post, generate metadata with Gemini, review, publish.
-2. **`/hugging_face`** — invent a Midnight Souls scene with Gemini, generate vertical HD video via Hugging Face Inference Providers, review the video, then metadata, publish.
-3. **`/pixabay`** — pick 3 random tags, download a vertical HD Pixabay video, scrape matching Pixabay Music, mux audio trimmed to the video length, review video then metadata, publish.
-4. **`/pixabay_url`** — paste a Pixabay video page URL, take its first tags for music search, mux audio, review video then metadata, publish.
+2. **`/pixabay`** — pick 3 random tags, download a vertical HD Pixabay video, scrape matching Pixabay Music, mux audio trimmed to the video length, review video then metadata, publish.
+3. **`/pixabay_url`** — paste a Pixabay video page URL, take its first tags for music search, mux audio, review video then metadata, publish.
 
 ## Flows
 
@@ -18,18 +17,6 @@ Telegram bot pipeline for publishing YouTube Shorts. Four flows:
 5. **Approve** uploads to YouTube Shorts, then deletes the local video.
 6. **Decline** deletes the local video and stops.
 7. **Modify** asks for edited JSON; bot re-shows the review keyboard.
-
-### Hugging Face (Midnight Souls)
-
-1. Admin sends `/hugging_face` (starts immediately — no topic input).
-2. Gemini invents a cozy ambient scene and 2–4 continuity-aware clip prompts for the channel brand.
-3. Hugging Face generates clips (text-to-video, then image-to-video from the last frame when possible).
-4. ffmpeg merges/normalizes to **1080×1920**, **8–15 seconds**, H.264 mp4.
-5. Bot sends the video to Telegram with **Approve** / **Decline** / **Modify**.
-6. **Approve** → Gemini metadata JSON + second review keyboard.
-7. **Modify** (video stage) → regenerate a new video.
-8. **Modify** (metadata stage) → paste edited JSON (same as Twitter).
-9. **Approve** (metadata) → YouTube upload; **Decline** → delete and stop.
 
 ### Pixabay (Midnight Souls stock)
 
@@ -63,10 +50,9 @@ Telegram bot pipeline for publishing YouTube Shorts. Four flows:
 ## Requirements
 
 - Python 3.12+
-- [ffmpeg](https://ffmpeg.org/) (yt-dlp merge + HF clip merge/normalize + Pixabay audio mux)
+- [ffmpeg](https://ffmpeg.org/) (yt-dlp merge + Pixabay audio mux)
 - Telegram bot token
 - Gemini API key (Google AI Studio)
-- Hugging Face token with Inference Providers permission (`HF_TOKEN`) — for `/hugging_face`
 - Pixabay API key (`PIXABAY_API_KEY`) — for `/pixabay` and `/pixabay_url`
 - Google Cloud project with YouTube Data API v3 enabled
 - OAuth client credentials for desktop/installed app
@@ -117,13 +103,7 @@ Edit `.env` with your values. See [Environment variables](#environment-variables
 2. Set `GEMINI_API_KEY`.
 3. Optionally set `GEMINI_MODEL` (default: `gemini-3.5-flash`).
 
-### 5. Hugging Face
-
-1. Create an access token at [Hugging Face settings](https://huggingface.co/settings/tokens) with Inference Providers permission.
-2. Set `HF_TOKEN`.
-3. Optionally override `HF_VIDEO_MODEL`, `HF_I2V_MODEL`, `HF_PROVIDER`, and `HF_TARGET_DURATION_SECONDS`.
-
-### 6. Pixabay API
+### 5. Pixabay API
 
 1. Open [Pixabay API docs](https://pixabay.com/api/docs/).
 2. Sign up or log in to Pixabay.
@@ -131,7 +111,7 @@ Edit `.env` with your values. See [Environment variables](#environment-variables
 4. Set `PIXABAY_API_KEY` in `.env`.
 5. Restart the bot. `/pixabay` and `/pixabay_url` refuse to start if the key is missing.
 
-### 7. YouTube OAuth
+### 6. YouTube OAuth
 
 1. In [Google Cloud Console](https://console.cloud.google.com/), enable **YouTube Data API v3**.
 2. Create OAuth credentials for a **Desktop app**.
@@ -140,7 +120,7 @@ Edit `.env` with your values. See [Environment variables](#environment-variables
 
 For Docker or headless deployment, generate `secrets/youtube_token.json` locally first, then provide it to the container (see [Docker](#docker)).
 
-### 8. Run locally
+### 7. Run locally
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000
@@ -201,11 +181,6 @@ The entrypoint writes these variables to `secrets/client_secret.json` and `secre
 | `TELEGRAM_WEBHOOK_SECRET` | no | — | Shared secret verified via `X-Telegram-Bot-Api-Secret-Token` |
 | `GEMINI_API_KEY` | yes | — | Google AI Studio API key |
 | `GEMINI_MODEL` | no | `gemini-3.5-flash` | Gemini model for prompts/metadata |
-| `HF_TOKEN` | for `/hugging_face` | — | Hugging Face token (Inference Providers) |
-| `HF_VIDEO_MODEL` | no | `Wan-AI/Wan2.2-TI2V-5B` | Text-to-video model |
-| `HF_I2V_MODEL` | no | `Wan-AI/Wan2.2-I2V-A14B` | Image-to-video continuity model |
-| `HF_PROVIDER` | no | `auto` | Inference provider routing |
-| `HF_TARGET_DURATION_SECONDS` | no | `12` | Preferred Shorts length (8–15) |
 | `PIXABAY_API_KEY` | for `/pixabay` and `/pixabay_url` | — | Pixabay API key from [api docs](https://pixabay.com/api/docs/) |
 | `YOUTUBE_CLIENT_SECRETS_FILE` | no | `secrets/client_secret.json` | Path to OAuth client JSON |
 | `YOUTUBE_TOKEN_FILE` | no | `secrets/youtube_token.json` | Path to saved OAuth token |
@@ -219,8 +194,8 @@ The entrypoint writes these variables to `secrets/client_secret.json` and `secre
 ## Usage
 
 1. Start a chat with your bot and send `/start`.
-2. Use `/twitter` with an X/Twitter URL, `/hugging_face` for an AI Short, `/pixabay` for a stock Short, or `/pixabay_url` with a Pixabay video page URL.
-3. Review video (HF/Pixabay) and/or metadata JSON, then choose an action.
+2. Use `/twitter` with an X/Twitter URL, `/pixabay` for a stock Short, or `/pixabay_url` with a Pixabay video page URL.
+3. Review video (Pixabay) and/or metadata JSON, then choose an action.
 
 Modify metadata JSON shape:
 
@@ -244,8 +219,6 @@ app/
   config.py            # Settings from environment
   schemas.py           # Pydantic models
   session_store.py     # In-memory job state
-  prompts/
-    midnight_souls.py  # Channel brand brief for HF video prompts
   data/
     pixabay_tags.py    # Lazy loader + append helper for Pixabay tags
     pixabay_tags.txt   # One search tag per line (appendable)
@@ -254,8 +227,6 @@ app/
     pixabay_client.py
     pixabay_audio_client.py  # Unofficial Music HTML/CDN scrape
     gemini_client.py
-    huggingface_video.py
-    video_pipeline.py
     ffmpeg_utils.py
     youtube_uploader.py
     cleanup.py
@@ -273,7 +244,6 @@ entrypoint.sh
 - Only the configured `ADMIN_CHAT_ID` can use the bot.
 - Session state is in-memory only; restarting the server clears pending jobs.
 - Stale pending sessions and videos older than `SESSION_TTL_HOURS` are cleaned on startup.
-- Starting a new Twitter, HF, or Pixabay job clears leftover files in `storage/videos/`.
+- Starting a new Twitter or Pixabay job clears leftover files in `storage/videos/`.
 - Pixabay videos are downloaded without re-encoding to preserve quality; only already-vertical HD clips are used. Music is scraped unofficially and muxed with ffmpeg (audio trimmed to video length).
 - Default YouTube privacy is `private`; change `YOUTUBE_PRIVACY_STATUS` to `public` or `unlisted` if needed.
-- Hugging Face free-tier clips are often short; the pipeline merges 2–4 continuity clips to reach 8–15 seconds.
