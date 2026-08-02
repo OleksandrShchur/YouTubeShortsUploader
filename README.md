@@ -117,6 +117,8 @@ Edit `.env` with your values. See [Environment variables](#environment-variables
 2. Create OAuth credentials for a **Desktop app**.
 3. Download the JSON file and save it as `secrets/client_secret.json`.
 4. On first upload, the app opens a browser for one-time OAuth. The refresh token is saved to `secrets/youtube_token.json`.
+5. On the OAuth consent screen, set publishing status to **In production**. While the app stays in **Testing**, Google expires refresh tokens after **7 days** and uploads fail with `invalid_grant` until you re-authorize.
+6. The app force-refreshes the access token on a schedule (default every 24 hours) and messages `ADMIN_CHAT_ID` with success or failure.
 
 For Docker or headless deployment, generate `secrets/youtube_token.json` locally first, then provide it to the container (see [Docker](#docker)).
 
@@ -186,6 +188,7 @@ The entrypoint writes these variables to `secrets/client_secret.json` and `secre
 | `YOUTUBE_TOKEN_FILE` | no | `secrets/youtube_token.json` | Path to saved OAuth token |
 | `YOUTUBE_PRIVACY_STATUS` | no | `private` | `private`, `public`, or `unlisted` |
 | `YOUTUBE_CATEGORY_ID` | no | `22` | YouTube category (22 = People & Blogs) |
+| `YOUTUBE_TOKEN_REFRESH_HOURS` | no | `24` | Force-refresh YouTube access token this often and notify admin |
 | `VIDEO_STORAGE_DIR` | no | `storage/videos` | Temporary video directory |
 | `SESSION_TTL_HOURS` | no | `24` | Hours before stale pending jobs are removed on startup |
 | `YOUTUBE_CLIENT_SECRETS_JSON` | no | — | Docker: inline OAuth client JSON |
