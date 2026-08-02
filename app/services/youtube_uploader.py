@@ -1,6 +1,7 @@
 import logging
 from pathlib import Path
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -23,10 +24,17 @@ class YouTubeUploadError(Exception):
 class YouTubeUploader:
     def __init__(self) -> None:
         self._service = None
+        self._token: str | None = None
+
+    def invalidate(self) -> None:
+        self._service = None
+        self._token = None
 
     def _get_service(self):
-        if self._service is None:
-            self._service = build("youtube", "v3", credentials=_load_credentials())
+        creds = load_credentials()
+        if self._service is None or self._token != creds.token:
+            self._service = build("youtube", "v3", credentials=creds)
+            self._token = creds.token
         return self._service
 
     def upload_short(
@@ -34,16 +42,7 @@ class YouTubeUploader:
         video_path: Path | str,
         metadata: ShortsMetadata,
     ) -> dict:
-        # #region agent log
-        import json as _json, time as _time
-        with open("debug-25cf5d.log", "a", encoding="utf-8") as _f:
-            _f.write(_json.dumps({"sessionId": "25cf5d", "hypothesisId": "A,E", "location": "youtube_uploader.py:upload_short", "message": "upload_short entry", "data": {"type": type(video_path).__name__, "value": str(video_path), "has_exists_attr": hasattr(video_path, "exists")}, "timestamp": int(_time.time() * 1000), "runId": "pre-fix"}) + "\n")
-        # #endregion
         video_path = Path(video_path)
-        # #region agent log
-        with open("debug-25cf5d.log", "a", encoding="utf-8") as _f:
-            _f.write(_json.dumps({"sessionId": "25cf5d", "hypothesisId": "A", "location": "youtube_uploader.py:upload_short", "message": "after Path conversion", "data": {"type": type(video_path).__name__, "value": str(video_path), "file_exists": video_path.exists()}, "timestamp": int(_time.time() * 1000), "runId": "post-fix"}) + "\n")
-        # #endregion
         if not video_path.exists():
             raise YouTubeUploadError(f"Video file not found: {video_path}")
 
@@ -90,7 +89,8 @@ class YouTubeUploader:
         return response
 
 
-def _load_credentials() -> Credentials:
+def load_credentials() -> Credentials:
+    """Load OAuth credentials, refreshing the access token when needed."""
     token_path = settings.youtube_token_file
     secrets_path = settings.youtube_client_secrets_file
 
@@ -102,8 +102,7 @@ def _load_credentials() -> Credentials:
         return creds
 
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        _save_credentials(creds)
+        _refresh_and_save(creds)
         return creds
 
     if not secrets_path.exists():
@@ -113,9 +112,45 @@ def _load_credentials() -> Credentials:
         )
 
     flow = InstalledAppFlow.from_client_secrets_file(str(secrets_path), SCOPES)
-    creds = flow.run_local_server(port=0)
+    creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
     _save_credentials(creds)
     return creds
+
+
+def refresh_credentials() -> Credentials:
+    """Force-refresh the access token using the stored refresh token and persist it."""
+    token_path = settings.youtube_token_file
+    if not token_path.exists():
+        raise YouTubeUploadError(
+            f"YouTube token file not found at {token_path}. "
+            "Complete OAuth once and deploy secrets/youtube_token.json."
+        )
+
+    creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+    if not creds.refresh_token:
+        raise YouTubeUploadError(
+            "YouTube token file has no refresh_token. Re-run OAuth with offline access."
+        )
+
+    _refresh_and_save(creds)
+    return creds
+
+
+def _refresh_and_save(creds: Credentials) -> None:
+    try:
+        creds.refresh(Request())
+    except RefreshError as exc:
+        raise YouTubeUploadError(
+            "YouTube token refresh failed (invalid_grant). The refresh token is expired "
+            "or revoked. Re-run browser OAuth locally, update the deployed token, and "
+            "set the Google Cloud OAuth consent screen to In production so refresh "
+            "tokens no longer expire after 7 days."
+        ) from exc
+    _save_credentials(creds)
+    logger.info(
+        "YouTube OAuth access token refreshed (expiry=%s)",
+        creds.expiry.isoformat() if creds.expiry else "unknown",
+    )
 
 
 def _save_credentials(creds: Credentials) -> None:

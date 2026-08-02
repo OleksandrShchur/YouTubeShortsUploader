@@ -1,13 +1,15 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
-from telegram import Update
+from telegram import Bot, Update
 
-from app.bot import create_telegram_application
+from app.bot import create_telegram_application, youtube_uploader
 from app.config import settings
 from app.services.cleanup import cleanup_stale_sessions, clear_video_storage_dir
+from app.services.youtube_uploader import YouTubeUploadError, refresh_credentials
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,6 +29,43 @@ def _webhook_path() -> str:
 
 def _webhook_url() -> str:
     return f"{settings.telegram_webhook_url.rstrip('/')}{_webhook_path()}"
+
+
+async def _notify_admin(bot: Bot, text: str) -> None:
+    try:
+        await bot.send_message(chat_id=settings.admin_chat_id, text=text)
+    except Exception:
+        logger.exception("Failed to notify admin about YouTube token refresh")
+
+
+async def _refresh_youtube_token_once(bot: Bot) -> None:
+    try:
+        creds = await asyncio.to_thread(refresh_credentials)
+        youtube_uploader.invalidate()
+        expiry = creds.expiry.isoformat() if creds.expiry else "unknown"
+        await _notify_admin(
+            bot,
+            f"YouTube OAuth token refreshed successfully.\nAccess token expiry: {expiry}",
+        )
+    except YouTubeUploadError as exc:
+        logger.error("YouTube token refresh failed: %s", exc)
+        await _notify_admin(bot, f"YouTube OAuth token refresh failed:\n{exc}")
+    except Exception as exc:
+        logger.exception("Unexpected YouTube token refresh error")
+        await _notify_admin(
+            bot,
+            f"YouTube OAuth token refresh failed unexpectedly:\n{exc}",
+        )
+
+
+async def _youtube_token_refresh_loop(bot: Bot) -> None:
+    interval_hours = max(1, settings.youtube_token_refresh_hours)
+    interval_seconds = interval_hours * 3600
+    # Refresh shortly after startup so a redeploy does not wait a full day.
+    await asyncio.sleep(15)
+    while True:
+        await _refresh_youtube_token_once(bot)
+        await asyncio.sleep(interval_seconds)
 
 
 @asynccontextmanager
@@ -65,9 +104,23 @@ async def lifespan(app: FastAPI):
             "Telegram bot started (long polling; set TELEGRAM_WEBHOOK_URL to use webhooks)"
         )
 
+    refresh_task = asyncio.create_task(
+        _youtube_token_refresh_loop(telegram_app.bot),
+        name="youtube-token-refresh",
+    )
+    logger.info(
+        "YouTube token refresh scheduled every %s hour(s)",
+        max(1, settings.youtube_token_refresh_hours),
+    )
+
     try:
         yield
     finally:
+        refresh_task.cancel()
+        try:
+            await refresh_task
+        except asyncio.CancelledError:
+            pass
         if use_webhook:
             await telegram_app.bot.delete_webhook()
         elif telegram_app.updater is not None:

@@ -228,6 +228,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if active:
         discard_job(active.job_id)
     session_store.set_chat_flow(chat_id, ChatFlow.IDLE)
+    # message_id > 1 means this chat already has prior messages (returning user).
+    if message.message_id > 1:
+        await message.reply_text("Bot Restarted")
     await _send_menu(message)
 
 
