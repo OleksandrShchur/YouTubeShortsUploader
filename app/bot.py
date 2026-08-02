@@ -216,7 +216,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _reject_unauthorized(update)
         return
 
-    await _send_menu(update.effective_message)
+    message = update.effective_message
+    if not message:
+        return
+
+    chat_id = message.chat_id
+    active = session_store.get_active_for_chat(chat_id)
+    if active and active.mode == JobMode.PROCESSING:
+        await message.reply_text("A job is already processing. Please wait.")
+        return
+    if active:
+        discard_job(active.job_id)
+    session_store.set_chat_flow(chat_id, ChatFlow.IDLE)
+    await _send_menu(message)
 
 
 async def twitter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
