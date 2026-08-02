@@ -19,14 +19,12 @@ class JobMode(str, Enum):
 class ChatFlow(str, Enum):
     IDLE = "idle"
     TWITTER = "twitter"
-    HUGGING_FACE = "hugging_face"
     PIXABAY = "pixabay"
     PIXABAY_URL = "pixabay_url"
 
 
 class JobSource(str, Enum):
     TWITTER = "twitter"
-    HUGGING_FACE = "huggingface"
     PIXABAY = "pixabay"
     PIXABAY_URL = "pixabay_url"
 
@@ -58,19 +56,6 @@ class ShortsMetadata(BaseModel):
     @classmethod
     def strip_text(cls, value: str) -> str:
         return str(value).strip()
-
-
-class VideoClipPrompt(BaseModel):
-    index: int
-    duration_hint_seconds: float = Field(..., ge=1, le=15)
-    prompt: str = Field(..., min_length=1)
-
-
-class VideoPromptPlan(BaseModel):
-    scene_summary: str = Field(..., min_length=1)
-    target_duration_seconds: float = Field(..., ge=8, le=15)
-    negative_prompt: str = Field(..., min_length=1)
-    clips: list[VideoClipPrompt] = Field(..., min_length=1, max_length=4)
 
 
 class JobSession(BaseModel):
