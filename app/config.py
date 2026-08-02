@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     youtube_token_file: Path = Path("secrets/youtube_token.json")
     youtube_privacy_status: str = "private"
     youtube_category_id: str = "22"
+    # How often to force-refresh the YouTube access token and notify the admin.
+    youtube_token_refresh_hours: int = 24
 
     video_storage_dir: Path = Path("storage/videos")
     session_ttl_hours: int = 24
