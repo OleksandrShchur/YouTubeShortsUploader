@@ -193,7 +193,7 @@ The entrypoint writes these variables to `secrets/client_secret.json` and `secre
 
 ## Usage
 
-1. Start a chat with your bot and send `/start`.
+1. Start a chat with your bot and send `/start` (also resets unfinished jobs and chat flow; refused only while a job is processing).
 2. Use `/twitter` with an X/Twitter URL, `/pixabay` for a stock Short, or `/pixabay_url` with a Pixabay video page URL.
 3. Review video (Pixabay) and/or metadata JSON, then choose an action.
 
@@ -243,6 +243,7 @@ entrypoint.sh
 - Prefer webhooks in production (`TELEGRAM_WEBHOOK_URL`); long polling is only for local use when that variable is unset.
 - Only the configured `ADMIN_CHAT_ID` can use the bot.
 - Session state is in-memory only; restarting the server clears pending jobs.
+- `/start` discards the chat’s unfinished job (and local media) and clears chat flow, then shows the menu. It does not interrupt a job that is actively processing.
 - Stale pending sessions and videos older than `SESSION_TTL_HOURS` are cleaned on startup.
 - Starting a new Twitter or Pixabay job clears leftover files in `storage/videos/`.
 - Pixabay videos are downloaded without re-encoding to preserve quality; only already-vertical HD clips are used. Music is scraped unofficially and muxed with ffmpeg (audio trimmed to video length).
