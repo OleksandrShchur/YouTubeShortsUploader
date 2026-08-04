@@ -1,10 +1,11 @@
 # YouTube Shorts Uploader
 
-Telegram bot pipeline for publishing YouTube Shorts. Three flows:
+Telegram bot pipeline for publishing YouTube Shorts. Four flows:
 
 1. **`/twitter`** — download a video from an X/Twitter post, generate metadata with Gemini, review, publish.
 2. **`/pixabay`** — pick 3 random tags, download a vertical HD Pixabay video, scrape matching Pixabay Music, mux audio trimmed to the video length, review video then metadata, publish.
 3. **`/pixabay_url`** — paste a Pixabay video page URL, take its first tags for music search, mux audio, review video then metadata, publish.
+4. **`/generate_shorts`** — Gemini invents Midnight Souls scene prompts, JSON2Video renders 2–4 vertical scenes, Pixabay music mux, then metadata review and publish.
 
 ## Flows
 
@@ -33,6 +34,17 @@ Telegram bot pipeline for publishing YouTube Shorts. Three flows:
    - **Modify video** → new 3-tag set → new video + new music.
 8. **Approve** (metadata) → YouTube upload on the same OAuth channel.
 
+### Generate Shorts (Midnight Souls AI)
+
+1. Admin sends `/generate_shorts` → confirmation with **Start** / **Back to menu**.
+2. Gemini invents a Midnight Souls prompt plan (2–4 seamless 9:16 clips, target **10–15s**, max **20s**) plus a Pixabay music search phrase.
+3. Prompt review: **Approve** / **Regenerate** / **Decline**.
+4. On approve, JSON2Video renders the scenes (`seedance-v1.5-pro`), downloads the MP4, scrapes Pixabay Music, and muxes audio.
+5. Video review: **Approve** → Gemini metadata; **Modify audio**; **Regenerate** (new prompts + re-render); **Decline**.
+6. Metadata review → YouTube upload (same as other flows).
+
+Free JSON2Video accounts have limited credits and add a watermark; paid plans remove the watermark.
+
 ### Pixabay URL
 
 1. Admin sends `/pixabay_url`, then a Pixabay video page URL (e.g. `https://pixabay.com/videos/example-123456/`).
@@ -53,7 +65,8 @@ Telegram bot pipeline for publishing YouTube Shorts. Three flows:
 - [ffmpeg](https://ffmpeg.org/) (yt-dlp merge + Pixabay audio mux)
 - Telegram bot token
 - Gemini API key (Google AI Studio)
-- Pixabay API key (`PIXABAY_API_KEY`) — for `/pixabay` and `/pixabay_url`
+- Pixabay API key (`PIXABAY_API_KEY`) — for `/pixabay`, `/pixabay_url`, and `/generate_shorts` music
+- JSON2Video API key (`JSON2VIDEO_API_KEY`) — for `/generate_shorts` scene rendering
 - Google Cloud project with YouTube Data API v3 enabled
 - OAuth client credentials for desktop/installed app
 
@@ -183,7 +196,11 @@ The entrypoint writes these variables to `secrets/client_secret.json` and `secre
 | `TELEGRAM_WEBHOOK_SECRET` | no | — | Shared secret verified via `X-Telegram-Bot-Api-Secret-Token` |
 | `GEMINI_API_KEY` | yes | — | Google AI Studio API key |
 | `GEMINI_MODEL` | no | `gemini-3.5-flash` | Gemini model for prompts/metadata |
-| `PIXABAY_API_KEY` | for `/pixabay` and `/pixabay_url` | — | Pixabay API key from [api docs](https://pixabay.com/api/docs/) |
+| `JSON2VIDEO_API_KEY` | for `/generate_shorts` | — | JSON2Video API key from [get-api-key](https://json2video.com/get-api-key/) |
+| `JSON2VIDEO_VIDEO_MODEL` | no | `seedance-v1.5-pro` | JSON2Video AI video model |
+| `GENERATE_SHORTS_TARGET_DURATION_SECONDS` | no | `12` | Preferred total Short duration |
+| `GENERATE_SHORTS_MAX_DURATION_SECONDS` | no | `20` | Hard max Short duration |
+| `PIXABAY_API_KEY` | for `/pixabay`, `/pixabay_url`, `/generate_shorts` music | — | Pixabay API key from [api docs](https://pixabay.com/api/docs/) |
 | `YOUTUBE_CLIENT_SECRETS_FILE` | no | `secrets/client_secret.json` | Path to OAuth client JSON |
 | `YOUTUBE_TOKEN_FILE` | no | `secrets/youtube_token.json` | Path to saved OAuth token |
 | `YOUTUBE_PRIVACY_STATUS` | no | `private` | `private`, `public`, or `unlisted` |
@@ -197,7 +214,7 @@ The entrypoint writes these variables to `secrets/client_secret.json` and `secre
 ## Usage
 
 1. Start a chat with your bot and send `/start` (also resets unfinished jobs and chat flow; refused only while a job is processing).
-2. Use `/twitter` with an X/Twitter URL, `/pixabay` for a stock Short, or `/pixabay_url` with a Pixabay video page URL.
+2. Use `/twitter` with an X/Twitter URL, `/pixabay` for a stock Short, `/pixabay_url` with a Pixabay video page URL, or `/generate_shorts` for AI Midnight Souls scenes.
 3. Review video (Pixabay) and/or metadata JSON, then choose an action.
 
 Modify metadata JSON shape:
