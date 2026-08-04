@@ -1,0 +1,15 @@
+from app.prompts.midnight_souls import (
+    BRAND_BRIEF,
+    CHANNEL_HANDLE,
+    CHANNEL_NAME,
+    DEFAULT_NEGATIVE_PROMPT,
+    VIDEO_PROMPT_SYSTEM,
+)
+
+__all__ = [
+    "BRAND_BRIEF",
+    "CHANNEL_HANDLE",
+    "CHANNEL_NAME",
+    "DEFAULT_NEGATIVE_PROMPT",
+    "VIDEO_PROMPT_SYSTEM",
+]

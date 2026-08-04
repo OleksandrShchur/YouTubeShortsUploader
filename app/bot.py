@@ -24,6 +24,7 @@ from app.schemas import (
     JobStatus,
     ReviewStage,
     ShortsMetadata,
+    VideoPromptPlan,
 )
 from app.services.cleanup import (
     clear_video_storage_dir,
@@ -33,6 +34,10 @@ from app.services.cleanup import (
 )
 from app.services.ffmpeg_utils import FFmpegError, mux_audio_onto_video, probe_duration_seconds
 from app.services.gemini_client import GeminiMetadataClient, GeminiMetadataError
+from app.services.generate_shorts_pipeline import (
+    GenerateShortsPipeline,
+    GenerateShortsPipelineError,
+)
 from app.services.pixabay_audio_client import (
     PixabayAudioError,
     PixabayAudioExhaustedError,
@@ -68,18 +73,22 @@ ACTION_MODIFY_AUDIO = "modify_audio"
 ACTION_MODIFY_VIDEO = "modify_video"
 ACTION_BACK_MENU = "back_menu"
 ACTION_START_PIXABAY = "start_pixabay"
+ACTION_START_GENERATE_SHORTS = "start_generate_shorts"
 
 MENU_TEXT = (
     "Available commands:\n"
     "/twitter — download an X/Twitter video, generate Shorts metadata, then publish\n"
     "/pixabay — fetch a 9:16 HD/4K Pixabay Short for Midnight Souls, then review & publish\n"
-    "/pixabay_url — paste a Pixabay video URL, add music, then review & publish"
+    "/pixabay_url — paste a Pixabay video URL, add music, then review & publish\n"
+    "/generate_shorts — invent Midnight Souls scenes with Gemini, render via JSON2Video, "
+    "add Pixabay music, then review & publish"
 )
 
 MAX_PIXABAY_PHRASE_ATTEMPTS = 3
 
 gemini_client = GeminiMetadataClient()
 youtube_uploader = YouTubeUploader()
+generate_shorts_pipeline = GenerateShortsPipeline()
 
 
 def _is_admin(update: Update) -> bool:
@@ -104,6 +113,15 @@ def _build_pixabay_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Start", callback_data=ACTION_START_PIXABAY)],
+            [InlineKeyboardButton("Back to menu", callback_data=ACTION_BACK_MENU)],
+        ]
+    )
+
+
+def _build_generate_shorts_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Start", callback_data=ACTION_START_GENERATE_SHORTS)],
             [InlineKeyboardButton("Back to menu", callback_data=ACTION_BACK_MENU)],
         ]
     )
@@ -159,8 +177,53 @@ def _build_pixabay_url_video_keyboard(job_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def _build_prompts_review_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Approve", callback_data=f"{ACTION_APPROVE}:{job_id}"),
+                InlineKeyboardButton("Decline", callback_data=f"{ACTION_DECLINE}:{job_id}"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Regenerate", callback_data=f"{ACTION_MODIFY}:{job_id}"
+                ),
+            ],
+            [InlineKeyboardButton("Back to menu", callback_data=ACTION_BACK_MENU)],
+        ]
+    )
+
+
+def _build_generate_shorts_video_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Approve", callback_data=f"{ACTION_APPROVE}:{job_id}"),
+                InlineKeyboardButton("Decline", callback_data=f"{ACTION_DECLINE}:{job_id}"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Modify audio", callback_data=f"{ACTION_MODIFY_AUDIO}:{job_id}"
+                ),
+                InlineKeyboardButton(
+                    "Regenerate", callback_data=f"{ACTION_MODIFY_VIDEO}:{job_id}"
+                ),
+            ],
+            [InlineKeyboardButton("Back to menu", callback_data=ACTION_BACK_MENU)],
+        ]
+    )
+
+
 def _is_pixabay_like(source: JobSource) -> bool:
     return source in {JobSource.PIXABAY, JobSource.PIXABAY_URL}
+
+
+def _uses_sidecar_media(source: JobSource) -> bool:
+    return source in {
+        JobSource.PIXABAY,
+        JobSource.PIXABAY_URL,
+        JobSource.GENERATE_SHORTS,
+    }
 
 
 def _video_keyboard_for_source(source: JobSource, job_id: str) -> InlineKeyboardMarkup:
@@ -168,6 +231,8 @@ def _video_keyboard_for_source(source: JobSource, job_id: str) -> InlineKeyboard
         return _build_pixabay_url_video_keyboard(job_id)
     if source == JobSource.PIXABAY:
         return _build_pixabay_video_keyboard(job_id)
+    if source == JobSource.GENERATE_SHORTS:
+        return _build_generate_shorts_video_keyboard(job_id)
     return _build_action_keyboard(job_id)
 
 
@@ -184,7 +249,12 @@ def _has_blocking_job(chat_id: int) -> tuple[bool, str | None]:
                 "You are waiting to send modified JSON for a pending review. "
                 "Use Back to menu, or send the JSON, or Decline the review first.",
             )
-        stage = "video" if active.review_stage == ReviewStage.VIDEO else "metadata"
+        if active.review_stage == ReviewStage.PROMPTS:
+            stage = "prompt"
+        elif active.review_stage == ReviewStage.VIDEO:
+            stage = "video"
+        else:
+            stage = "metadata"
         return (
             True,
             f"You have a pending {stage} review. Use the buttons on the latest review "
@@ -321,6 +391,52 @@ async def pixabay_url_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+async def generate_shorts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await _reject_unauthorized(update)
+        return
+
+    message = update.effective_message
+    if not message:
+        return
+
+    blocked, reason = _has_blocking_job(message.chat_id)
+    if blocked:
+        await message.reply_text(reason or "A job is already in progress.")
+        return
+
+    missing: list[str] = []
+    if not settings.json2video_api_key:
+        missing.append("JSON2VIDEO_API_KEY")
+    if not settings.pixabay_api_key:
+        missing.append("PIXABAY_API_KEY")
+    if missing:
+        await message.reply_text(
+            "Missing config: "
+            + ", ".join(missing)
+            + ".\n"
+            "JSON2Video: https://json2video.com/get-api-key/\n"
+            "Pixabay: https://pixabay.com/api/docs/\n"
+            "Add them to .env, then retry /generate_shorts."
+        )
+        return
+
+    session_store.set_chat_flow(message.chat_id, ChatFlow.GENERATE_SHORTS)
+    await message.reply_text(
+        "Ready to generate a Midnight Souls Short.\n\n"
+        "Flow:\n"
+        "1) Gemini invents 2–4 scene prompts (10–15s, max 20s)\n"
+        "2) You approve the prompts\n"
+        "3) JSON2Video renders the scenes (Seedance)\n"
+        "4) Pixabay music is muxed on\n"
+        "5) You approve video → Gemini metadata → YouTube\n\n"
+        "Note: JSON2Video free tier has limited credits (~1–2 Shorts) and "
+        "adds a watermark; paid plans remove the watermark.\n\n"
+        "Tap Start to begin, or Back to menu if this was a misclick.",
+        reply_markup=_build_generate_shorts_confirm_keyboard(),
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update):
         await _reject_unauthorized(update)
@@ -342,7 +458,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if active and active.status == JobStatus.PENDING_REVIEW:
-        stage = "video" if active.review_stage == ReviewStage.VIDEO else "metadata"
+        if active.review_stage == ReviewStage.PROMPTS:
+            stage = "prompt"
+        elif active.review_stage == ReviewStage.VIDEO:
+            stage = "video"
+        else:
+            stage = "metadata"
         await message.reply_text(
             f"You have a pending {stage} review. Use the buttons on the latest review "
             "message, or Decline it before starting a new job."
@@ -367,7 +488,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if session_store.get_chat_flow(message.chat_id) != ChatFlow.TWITTER:
         await message.reply_text(
-            "Use /twitter, /pixabay, or /pixabay_url to start a Shorts flow, "
+            "Use /twitter, /pixabay, /pixabay_url, or /generate_shorts to start a Shorts flow, "
             "or /start for available commands."
         )
         return
@@ -956,6 +1077,399 @@ async def _run_pixabay_url_generation(message, pixabay_url: str) -> None:
         )
 
 
+def _format_prompt_plan_caption(plan: VideoPromptPlan) -> str:
+    clip_lines = []
+    for clip in plan.clips:
+        clip_lines.append(
+            f"{clip.index}) {clip.duration_hint_seconds:.0f}s — {clip.prompt}"
+        )
+    clips_block = "\n".join(clip_lines)
+    return (
+        "Midnight Souls prompt plan (review before rendering):\n\n"
+        f"Summary: {plan.scene_summary}\n"
+        f"Target duration: {plan.target_duration_seconds:.0f}s\n"
+        f"Music search: {plan.music_search_phrase}\n\n"
+        f"Clips:\n{clips_block}\n\n"
+        f"Negative: {plan.negative_prompt}\n\n"
+        "Approve → render with JSON2Video + Pixabay music\n"
+        "Regenerate → invent a new prompt plan\n"
+        "Decline → discard"
+    )
+
+
+def _generate_shorts_review_caption(plan: VideoPromptPlan, audio: PixabayAudioResult) -> str:
+    return (
+        "Generated Midnight Souls Short (video + audio review):\n"
+        f"Scene: {plan.scene_summary}\n"
+        f"Music search: {plan.music_search_phrase}\n"
+        f"{audio.attribution}\n\n"
+        "Approve → generate title/description with Gemini\n"
+        "Modify audio → keep video, fetch different music\n"
+        "Regenerate → new prompts + re-render\n"
+        "Decline → discard"
+    )
+
+
+async def _send_prompt_review(
+    message,
+    job_id: str,
+    plan: VideoPromptPlan,
+    status_msg=None,
+) -> None:
+    review_message = await message.reply_text(
+        _format_prompt_plan_caption(plan),
+        reply_markup=_build_prompts_review_keyboard(job_id),
+    )
+    session = session_store.get(job_id)
+    video_path = session.video_path if session else ""
+    session_store.update_video(
+        job_id,
+        video_path,
+        video_prompts=plan.model_dump(),
+        review_stage=ReviewStage.PROMPTS,
+        mode=JobMode.AWAITING_URL,
+        review_message_id=review_message.message_id,
+        pixabay_phrase=plan.music_search_phrase,
+    )
+    if status_msg:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+
+async def _run_generate_shorts_invent_prompts(
+    message,
+    *,
+    existing_job_id: str | None = None,
+) -> None:
+    status_msg = await message.reply_text("Inventing Midnight Souls scene with Gemini...")
+    job_id = existing_job_id or uuid4().hex[:12]
+
+    try:
+        if existing_job_id:
+            session = session_store.get(existing_job_id)
+            if not session:
+                await status_msg.edit_text("This job no longer exists.")
+                await message.reply_text(MENU_TEXT)
+                return
+            session_store.set_mode(job_id, JobMode.PROCESSING)
+            session_store.set_review_stage(job_id, ReviewStage.PROMPTS)
+        else:
+            clear_video_storage_dir(settings.video_storage_path)
+            pending_path = str(settings.video_storage_path / f"{job_id}.pending")
+            session_store.create_job(
+                message.chat_id,
+                pending_path,
+                job_id=job_id,
+                source=JobSource.GENERATE_SHORTS,
+                review_stage=ReviewStage.PROMPTS,
+            )
+
+        plan = await asyncio.to_thread(gemini_client.generate_video_prompts)
+        await _send_prompt_review(message, job_id, plan, status_msg)
+    except GeminiMetadataError as exc:
+        if existing_job_id:
+            session_store.set_mode(job_id, JobMode.AWAITING_URL)
+            await status_msg.edit_text(f"Gemini prompt invent failed: {exc}")
+        else:
+            discard_job(job_id)
+            await status_msg.edit_text(f"Gemini prompt invent failed: {exc}")
+            await message.reply_text(MENU_TEXT)
+    except Exception:
+        logger.exception("Unexpected generate_shorts prompt invent error")
+        if existing_job_id:
+            session_store.set_mode(job_id, JobMode.AWAITING_URL)
+            await status_msg.edit_text("An unexpected error occurred while inventing prompts.")
+        else:
+            discard_job(job_id)
+            await status_msg.edit_text("An unexpected error occurred while inventing prompts.")
+            await message.reply_text(MENU_TEXT)
+
+
+async def _run_generate_shorts_render(message, job_id: str) -> None:
+    status_msg = await message.reply_text("Starting JSON2Video Shorts render...")
+    session = session_store.get(job_id)
+    if not session or not session.video_prompts:
+        await status_msg.edit_text("Prompt plan is missing; invent prompts again.")
+        await message.reply_text(MENU_TEXT)
+        return
+
+    try:
+        plan = VideoPromptPlan.model_validate(session.video_prompts)
+    except Exception as exc:
+        await status_msg.edit_text(f"Stored prompt plan is invalid: {exc}")
+        return
+
+    session_store.set_mode(job_id, JobMode.PROCESSING)
+    progress_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def on_progress(text: str) -> None:
+        loop.call_soon_threadsafe(progress_queue.put_nowait, text)
+
+    async def pump_progress() -> None:
+        while True:
+            item = await progress_queue.get()
+            if item is None:
+                return
+            try:
+                await status_msg.edit_text(item)
+            except Exception:
+                pass
+
+    pump_task = asyncio.create_task(pump_progress())
+    video_path: Path | None = None
+    silent_path: Path | None = None
+    try:
+        used_audio_ids = list(session.pixabay_used_audio_ids or [])
+        video_path, audio_result, silent_path = await asyncio.to_thread(
+            generate_shorts_pipeline.render_from_plan,
+            plan,
+            settings.video_storage_path,
+            job_id,
+            used_audio_ids=used_audio_ids,
+            on_progress=on_progress,
+        )
+        loop.call_soon_threadsafe(progress_queue.put_nowait, None)
+        await pump_task
+
+        used_audio_ids = [*used_audio_ids, audio_result.audio_id]
+        pixabay_meta = {
+            "silent_path": str(silent_path),
+            "audio_id": audio_result.audio_id,
+            "audio_page_url": audio_result.page_url,
+            "audio_user": audio_result.user,
+            "audio_duration": audio_result.duration,
+            "audio_name": audio_result.name,
+            "audio_path": str(audio_result.local_path),
+        }
+        session_store.update_video(
+            job_id,
+            str(video_path),
+            video_prompts=plan.model_dump(),
+            review_stage=ReviewStage.VIDEO,
+            mode=JobMode.AWAITING_URL,
+            pixabay_phrase=plan.music_search_phrase,
+            pixabay_used_audio_ids=used_audio_ids,
+            pixabay_meta=pixabay_meta,
+        )
+        await _send_video_review(
+            message,
+            job_id,
+            video_path,
+            plan.scene_summary,
+            status_msg,
+            caption=_generate_shorts_review_caption(plan, audio_result),
+            reply_markup=_build_generate_shorts_video_keyboard(job_id),
+        )
+    except GenerateShortsPipelineError as exc:
+        await progress_queue.put(None)
+        try:
+            await pump_task
+        except Exception:
+            pass
+        session_store.set_mode(job_id, JobMode.AWAITING_URL)
+        session_store.set_review_stage(job_id, ReviewStage.PROMPTS)
+        for path in (silent_path, video_path):
+            if path:
+                delete_video_file(path)
+        await status_msg.edit_text(f"Generate Shorts render failed: {exc}")
+        await message.reply_text(
+            "Prompt plan is still available. Approve again to retry render, "
+            "Regenerate for a new plan, or Decline.",
+            reply_markup=_build_prompts_review_keyboard(job_id),
+        )
+    except Exception:
+        logger.exception("Unexpected generate_shorts render error")
+        await progress_queue.put(None)
+        try:
+            await pump_task
+        except Exception:
+            pass
+        session_store.set_mode(job_id, JobMode.AWAITING_URL)
+        session_store.set_review_stage(job_id, ReviewStage.PROMPTS)
+        for path in (silent_path, video_path):
+            if path:
+                delete_video_file(path)
+        await status_msg.edit_text("An unexpected error occurred while rendering Shorts.")
+        await message.reply_text(
+            "Prompt plan is still available. Approve again to retry render, "
+            "Regenerate for a new plan, or Decline.",
+            reply_markup=_build_prompts_review_keyboard(job_id),
+        )
+
+
+async def _run_generate_shorts_modify_audio(message, job_id: str) -> None:
+    status_msg = await message.reply_text("Fetching different Pixabay music...")
+    session = session_store.get(job_id)
+    if not session:
+        await status_msg.edit_text("This job no longer exists.")
+        await message.reply_text(MENU_TEXT)
+        return
+
+    meta = session.pixabay_meta if isinstance(session.pixabay_meta, dict) else {}
+    silent_path = Path(str(meta["silent_path"])) if meta.get("silent_path") else None
+    phrase = session.pixabay_phrase
+    used_audio_ids = list(session.pixabay_used_audio_ids or [])
+
+    if not silent_path or not silent_path.exists():
+        await status_msg.edit_text("Silent video is missing; cannot modify audio. Try Regenerate.")
+        session_store.set_mode(job_id, JobMode.AWAITING_URL)
+        return
+    if not phrase:
+        await status_msg.edit_text("Music search phrase is missing; cannot modify audio.")
+        session_store.set_mode(job_id, JobMode.AWAITING_URL)
+        return
+
+    try:
+        plan = (
+            VideoPromptPlan.model_validate(session.video_prompts)
+            if session.video_prompts
+            else None
+        )
+        session_store.set_mode(job_id, JobMode.PROCESSING)
+        old_muxed = Path(session.video_path) if session.video_path else None
+        old_audio = Path(str(meta["audio_path"])) if meta.get("audio_path") else None
+
+        await status_msg.edit_text(f"Searching Pixabay Music (same tags):\n{phrase}")
+        video_duration = await asyncio.to_thread(probe_duration_seconds, silent_path)
+        audio_result = await asyncio.to_thread(
+            find_and_download_audio,
+            phrase,
+            settings.video_storage_path,
+            job_id,
+            min_duration_seconds=video_duration,
+            used_ids=used_audio_ids,
+            filename=f"{job_id}_audio_tmp.mp3",
+        )
+        used_audio_ids = [*used_audio_ids, audio_result.audio_id]
+        muxed_path = settings.video_storage_path / f"{job_id}.mp4"
+        final_audio = settings.video_storage_path / f"{job_id}_audio.mp3"
+        await status_msg.edit_text("Muxing new audio onto video...")
+        temp_muxed = settings.video_storage_path / f"{job_id}_mux_tmp.mp4"
+        await asyncio.to_thread(
+            mux_audio_onto_video,
+            silent_path,
+            audio_result.local_path,
+            temp_muxed,
+        )
+        if muxed_path.exists():
+            muxed_path.unlink()
+        temp_muxed.replace(muxed_path)
+        if final_audio.exists() and final_audio != audio_result.local_path:
+            final_audio.unlink()
+        audio_result.local_path.replace(final_audio)
+        audio_result = PixabayAudioResult(
+            audio_id=audio_result.audio_id,
+            page_url=audio_result.page_url,
+            user=audio_result.user,
+            duration=audio_result.duration,
+            phrase=audio_result.phrase,
+            download_url=audio_result.download_url,
+            local_path=final_audio,
+            name=audio_result.name,
+        )
+        if old_audio and old_audio.exists() and old_audio != final_audio:
+            delete_video_file(old_audio)
+        if old_muxed and old_muxed.exists() and old_muxed != muxed_path:
+            delete_video_file(old_muxed)
+
+        video_meta = {
+            k: v
+            for k, v in meta.items()
+            if k
+            not in {
+                "audio_id",
+                "audio_page_url",
+                "audio_user",
+                "audio_duration",
+                "audio_name",
+                "audio_path",
+            }
+        }
+        video_meta.update(
+            {
+                "silent_path": str(silent_path),
+                "audio_id": audio_result.audio_id,
+                "audio_page_url": audio_result.page_url,
+                "audio_user": audio_result.user,
+                "audio_duration": audio_result.duration,
+                "audio_name": audio_result.name,
+                "audio_path": str(audio_result.local_path),
+            }
+        )
+        session_store.update_video(
+            job_id,
+            str(muxed_path),
+            video_prompts=session.video_prompts,
+            review_stage=ReviewStage.VIDEO,
+            mode=JobMode.AWAITING_URL,
+            pixabay_phrase=phrase,
+            pixabay_used_audio_ids=used_audio_ids,
+            pixabay_meta=video_meta,
+        )
+        scene = plan.scene_summary if plan else "Midnight Souls Short"
+        caption = (
+            _generate_shorts_review_caption(plan, audio_result)
+            if plan
+            else (
+                "Generated Midnight Souls Short (video + audio review):\n"
+                f"{audio_result.attribution}\n\n"
+                "Approve → generate title/description with Gemini\n"
+                "Modify audio → keep video, fetch different music\n"
+                "Regenerate → new prompts + re-render\n"
+                "Decline → discard"
+            )
+        )
+        await _send_video_review(
+            message,
+            job_id,
+            muxed_path,
+            scene,
+            status_msg,
+            caption=caption,
+            reply_markup=_build_generate_shorts_video_keyboard(job_id),
+        )
+    except (PixabayAudioError, FFmpegError) as exc:
+        session_store.set_mode(job_id, JobMode.AWAITING_URL)
+        await status_msg.edit_text(f"Modify audio failed: {exc}")
+    except Exception:
+        logger.exception("Unexpected generate_shorts modify audio error")
+        session_store.set_mode(job_id, JobMode.AWAITING_URL)
+        await status_msg.edit_text("An unexpected error occurred while changing audio.")
+
+
+async def _handle_prompts_stage_action(update: Update, action: str, job_id: str) -> None:
+    query = update.callback_query
+    assert query is not None
+    message = query.message
+    session = session_store.get(job_id)
+    if not session or not message:
+        return
+
+    if action == ACTION_DECLINE:
+        discard_job(job_id)
+        await _edit_callback_message(query, "Declined. Prompt plan discarded.")
+        await message.reply_text(MENU_TEXT)
+        return
+
+    if action == ACTION_MODIFY:
+        await _edit_callback_message(query, "Inventing a new prompt plan...")
+        await _run_generate_shorts_invent_prompts(message, existing_job_id=job_id)
+        return
+
+    if action == ACTION_APPROVE:
+        if not session.video_prompts:
+            await _edit_callback_message(query, "Prompt plan is missing; regenerate first.")
+            return
+        await _edit_callback_message(query, "Prompt approved. Starting render...")
+        await _run_generate_shorts_render(message, job_id)
+        return
+
+    await _edit_callback_message(query, "Unknown action.")
+
+
 async def _send_video_review(
     message,
     job_id: str,
@@ -1110,7 +1624,7 @@ async def _handle_video_stage_action(update: Update, action: str, job_id: str) -
         return
 
     if action == ACTION_DECLINE:
-        if _is_pixabay_like(session.source):
+        if _uses_sidecar_media(session.source):
             delete_pixabay_job_files(job_id)
         else:
             delete_video_file(session.video_path)
@@ -1120,6 +1634,10 @@ async def _handle_video_stage_action(update: Update, action: str, job_id: str) -
         return
 
     if action == ACTION_MODIFY_AUDIO:
+        if session.source == JobSource.GENERATE_SHORTS:
+            await _edit_callback_message(query, "Fetching different Pixabay music...")
+            await _run_generate_shorts_modify_audio(message, job_id)
+            return
         if not _is_pixabay_like(session.source):
             await _edit_callback_message(query, "Change audio is only available for Pixabay.")
             return
@@ -1130,6 +1648,11 @@ async def _handle_video_stage_action(update: Update, action: str, job_id: str) -
         return
 
     if action == ACTION_MODIFY_VIDEO:
+        if session.source == JobSource.GENERATE_SHORTS:
+            await _edit_callback_message(query, "Inventing a new prompt plan...")
+            delete_pixabay_job_files(job_id, settings.video_storage_path)
+            await _run_generate_shorts_invent_prompts(message, existing_job_id=job_id)
+            return
         if session.source != JobSource.PIXABAY:
             await _edit_callback_message(query, "Modify video is only available for Pixabay.")
             return
@@ -1142,6 +1665,11 @@ async def _handle_video_stage_action(update: Update, action: str, job_id: str) -
             # Legacy single Modify button should behave like Modify video.
             await _edit_callback_message(query, "Fetching another Pixabay video + audio...")
             await _run_pixabay_generation(message, existing_job_id=job_id)
+            return
+        if session.source == JobSource.GENERATE_SHORTS:
+            await _edit_callback_message(query, "Inventing a new prompt plan...")
+            delete_pixabay_job_files(job_id, settings.video_storage_path)
+            await _run_generate_shorts_invent_prompts(message, existing_job_id=job_id)
             return
         await _edit_callback_message(query, "Modify video is only available for Pixabay.")
         return
@@ -1197,7 +1725,7 @@ async def _handle_metadata_stage_action(update: Update, action: str, job_id: str
         return
 
     if action == ACTION_DECLINE:
-        if _is_pixabay_like(session.source):
+        if _uses_sidecar_media(session.source):
             delete_pixabay_job_files(job_id)
         else:
             delete_video_file(session.video_path)
@@ -1228,7 +1756,7 @@ async def _handle_metadata_stage_action(update: Update, action: str, job_id: str
 
         video_id = response.get("id", "unknown")
         youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-        if _is_pixabay_like(session.source):
+        if _uses_sidecar_media(session.source):
             delete_pixabay_job_files(job_id)
         else:
             delete_video_file(session.video_path)
@@ -1287,6 +1815,41 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _run_pixabay_generation(message)
         return
 
+    if query.data == ACTION_START_GENERATE_SHORTS:
+        message = query.message
+        if not message:
+            await query.answer()
+            return
+
+        chat_id = message.chat_id
+        blocked, reason = _has_blocking_job(chat_id)
+        if blocked:
+            await query.answer(reason or "A job is already in progress.", show_alert=True)
+            return
+
+        await query.answer()
+
+        missing: list[str] = []
+        if not settings.json2video_api_key:
+            missing.append("JSON2VIDEO_API_KEY")
+        if not settings.pixabay_api_key:
+            missing.append("PIXABAY_API_KEY")
+        if missing:
+            await _edit_callback_message(
+                query,
+                "Missing config: "
+                + ", ".join(missing)
+                + ". Add them to .env and retry /generate_shorts.",
+            )
+            return
+
+        if session_store.get_chat_flow(chat_id) != ChatFlow.GENERATE_SHORTS:
+            session_store.set_chat_flow(chat_id, ChatFlow.GENERATE_SHORTS)
+
+        await _edit_callback_message(query, "Starting Generate Shorts flow...")
+        await _run_generate_shorts_invent_prompts(message)
+        return
+
     await query.answer()
 
     try:
@@ -1308,6 +1871,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("This job is still processing. Please wait.", show_alert=True)
         return
 
+    if session.review_stage == ReviewStage.PROMPTS:
+        await _handle_prompts_stage_action(update, action, job_id)
+        return
+
     if session.review_stage == ReviewStage.VIDEO:
         await _handle_video_stage_action(update, action, job_id)
         return
@@ -1325,6 +1892,7 @@ def create_telegram_application(*, use_webhook: bool = False) -> Application:
     application.add_handler(CommandHandler("twitter", twitter_command))
     application.add_handler(CommandHandler("pixabay", pixabay_command))
     application.add_handler(CommandHandler("pixabay_url", pixabay_url_command))
+    application.add_handler(CommandHandler("generate_shorts", generate_shorts_command))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
