@@ -33,6 +33,11 @@ class Settings(BaseSettings):
 
     pixabay_api_key: str = ""
 
+    json2video_api_key: str = ""
+    json2video_video_model: str = "seedance-v1.5-pro"
+    generate_shorts_target_duration_seconds: float = 12.0
+    generate_shorts_max_duration_seconds: float = 20.0
+
     @property
     def video_storage_path(self) -> Path:
         path = self.video_storage_dir
