@@ -7,6 +7,13 @@ from pathlib import Path
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
+from tenacity import (
+    Retrying,
+    before_sleep_log,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 from app.config import settings
 from app.prompts.midnight_souls import DEFAULT_NEGATIVE_PROMPT, VIDEO_PROMPT_SYSTEM
@@ -16,6 +23,7 @@ from app.utils.metadata_rules import normalize_metadata
 logger = logging.getLogger(__name__)
 GEMINI_FILE_POLL_INTERVAL_SECONDS = 2
 GEMINI_FILE_POLL_TIMEOUT_SECONDS = 180
+GEMINI_GENERATION_ATTEMPTS = 4  # Initial request plus three retries per model.
 
 METADATA_PROMPT = """You are a YouTube Shorts metadata expert.
 
@@ -56,17 +64,13 @@ class GeminiMetadataClient:
             f"Invent a new Midnight Souls Shorts scene. "
             f"Prefer target_duration_seconds around {duration:.0f}."
         )
-        try:
-            response = self._client.models.generate_content(
-                model=settings.gemini_model,
-                contents=[VIDEO_PROMPT_SYSTEM, user_message],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.9,
-                ),
-            )
-        except genai_errors.ClientError as exc:
-            raise self._map_client_error(exc) from exc
+        response = self._generate_content(
+            contents=[VIDEO_PROMPT_SYSTEM, user_message],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.9,
+            ),
+        )
 
         raw_text = (response.text or "").strip()
         if not raw_text:
@@ -101,8 +105,7 @@ class GeminiMetadataClient:
             state = getattr(uploaded_file, "state", None)
 
         try:
-            response = self._client.models.generate_content(
-                model=settings.gemini_model,
+            response = self._generate_content(
                 contents=[
                     types.Part.from_uri(
                         file_uri=uploaded_file.uri,
@@ -115,8 +118,6 @@ class GeminiMetadataClient:
                     temperature=0.7,
                 ),
             )
-        except genai_errors.ClientError as exc:
-            raise self._map_client_error(exc) from exc
         finally:
             try:
                 if uploaded_file.name:
@@ -131,11 +132,62 @@ class GeminiMetadataClient:
         payload = _parse_json_response(raw_text)
         return normalize_metadata(payload)
 
-    def _map_client_error(self, exc: genai_errors.ClientError) -> GeminiMetadataError:
-        status_code = getattr(exc, "status_code", None)
+    def _generate_content(
+        self,
+        *,
+        contents: list[str | types.Part],
+        config: types.GenerateContentConfig,
+    ) -> types.GenerateContentResponse:
+        models = [settings.gemini_model]
+        fallback_model = settings.gemini_fallback_model.strip()
+        if fallback_model and fallback_model not in models:
+            models.append(fallback_model)
+
+        # Keep SDK retries from multiplying the application retry budget.
+        config = config.model_copy(update={
+            "http_options": types.HttpOptions(
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
+        })
+        last_error = None
+        for model in models:
+            try:
+                return Retrying(
+                    retry=retry_if_exception_type(genai_errors.ServerError),
+                    wait=wait_exponential_jitter(initial=1, max=4),
+                    stop=stop_after_attempt(GEMINI_GENERATION_ATTEMPTS),
+                    before_sleep=before_sleep_log(logger, logging.WARNING),
+                    reraise=True,
+                )(
+                    self._client.models.generate_content,
+                    model=model,
+                    contents=contents,
+                    config=config,
+                )
+            except genai_errors.ClientError as exc:
+                raise self._map_client_error(exc, model=model) from exc
+            except genai_errors.ServerError as exc:
+                last_error = exc
+                if model != models[-1]:
+                    logger.warning(
+                        "Gemini model '%s' failed after %d attempts; falling back to '%s'",
+                        model,
+                        GEMINI_GENERATION_ATTEMPTS,
+                        fallback_model,
+                    )
+
+        raise GeminiMetadataError(
+            f"Gemini is temporarily unavailable after retries for model(s): "
+            f"{', '.join(models)}. Please try again later."
+        ) from last_error
+
+    def _map_client_error(
+        self, exc: genai_errors.ClientError, *, model: str
+    ) -> GeminiMetadataError:
+        status_code = exc.code
         if status_code == 429:
             return GeminiMetadataError(
-                f"Gemini quota exceeded for model '{settings.gemini_model}'. "
+                f"Gemini quota exceeded for model '{model}'. "
                 "Wait a minute and retry, check usage at https://ai.dev/rate-limit, "
                 "or try a different model in GEMINI_MODEL (e.g. gemini-3.5-flash)."
             )
