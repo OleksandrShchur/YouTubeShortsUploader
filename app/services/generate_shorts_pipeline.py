@@ -1,4 +1,4 @@
-"""Generate Midnight Souls Shorts via Gemini prompts + JSON2Video + Pixabay music."""
+"""Generate Midnight Souls Shorts via Gemini video generation + Pixabay music."""
 
 from __future__ import annotations
 
@@ -10,15 +10,12 @@ from app.config import settings
 from app.schemas import VideoPromptPlan
 from app.services.ffmpeg_utils import (
     FFmpegError,
+    concat_videos,
     mux_audio_onto_video,
+    normalize_to_shorts,
     probe_duration_seconds,
 )
-from app.services.json2video_client import (
-    Json2VideoError,
-    create_movie,
-    download_movie,
-    wait_for_movie,
-)
+from app.services.gemini_video_client import GeminiVideoClient, GeminiVideoError
 from app.services.pixabay_audio_client import (
     PixabayAudioError,
     PixabayAudioResult,
@@ -40,6 +37,9 @@ class GenerateShortsPipelineError(Exception):
 
 
 class GenerateShortsPipeline:
+    def __init__(self) -> None:
+        self._video_client = GeminiVideoClient()
+
     def render_from_plan(
         self,
         plan: VideoPromptPlan,
@@ -49,7 +49,7 @@ class GenerateShortsPipeline:
         used_audio_ids: list[int] | None = None,
         on_progress: ProgressCallback | None = None,
     ) -> tuple[Path, PixabayAudioResult, Path]:
-        """Render silent video via JSON2Video, mux Pixabay music.
+        """Render Gemini video clips, mux Pixabay music.
 
         Returns (muxed_path, audio_result, silent_path).
         """
@@ -62,15 +62,31 @@ class GenerateShortsPipeline:
         silent_path = storage_dir / f"{job_id}_silent.mp4"
         audio_path = storage_dir / f"{job_id}_audio.mp3"
         muxed_path = storage_dir / f"{job_id}.mp4"
+        clip_dir = storage_dir / f"{job_id}_clips"
 
         try:
-            progress("Submitting scenes to JSON2Video...")
-            payload = build_movie_payload(plan, cache=False)
-            project_id = create_movie(payload)
-            progress(f"Rendering JSON2Video project {project_id}...")
-            movie_url = wait_for_movie(project_id)
-            progress("Downloading rendered video...")
-            download_movie(movie_url, silent_path)
+            clip_dir.mkdir(parents=True, exist_ok=True)
+            rendered_clips: list[Path] = []
+            for clip_number, clip in enumerate(plan.clips, start=1):
+                duration = _clamp_clip_duration(clip.duration_hint_seconds)
+                progress(
+                    f"Generating scene {clip_number}/{len(plan.clips)} with Gemini..."
+                )
+                generated_path = clip_dir / f"{clip_number}_generated.mp4"
+                normalized_path = clip_dir / f"{clip_number}.mp4"
+                self._video_client.generate_video(
+                    _build_video_prompt(plan, clip_number, clip.prompt, duration),
+                    generated_path,
+                )
+                normalize_to_shorts(
+                    generated_path,
+                    normalized_path,
+                    max_duration=duration,
+                )
+                rendered_clips.append(normalized_path)
+
+            progress("Combining generated scenes...")
+            concat_videos(rendered_clips, silent_path)
 
             duration = probe_duration_seconds(silent_path)
             max_allowed = min(
@@ -102,45 +118,29 @@ class GenerateShortsPipeline:
             mux_audio_onto_video(silent_path, audio_result.local_path, muxed_path)
             progress(f"Ready ({duration:.1f}s).")
             return muxed_path, audio_result, silent_path
-        except (Json2VideoError, PixabayAudioError, FFmpegError) as exc:
+        except (GeminiVideoError, PixabayAudioError, FFmpegError) as exc:
             raise GenerateShortsPipelineError(str(exc)) from exc
 
 
-def build_movie_payload(plan: VideoPromptPlan, *, cache: bool = False) -> dict:
-    """Build a vertical Shorts movie with one AI video element per clip scene."""
-    model = settings.json2video_video_model
-    scenes: list[dict] = []
-    for clip in plan.clips:
-        duration = _clamp_clip_duration(clip.duration_hint_seconds)
-        prompt = clip.prompt.strip()
-        if plan.negative_prompt:
-            prompt = f"{prompt}. Avoid: {plan.negative_prompt}"
-        scenes.append(
-            {
-                "duration": duration,
-                "elements": [
-                    {
-                        "type": "video",
-                        "model": model,
-                        "prompt": prompt,
-                        "duration": duration,
-                        "aspect-ratio": "vertical",
-                        "resize": "cover",
-                        "generate_audio": False,
-                        "resolution": "720p",
-                        "cache": cache,
-                    }
-                ],
-            }
-        )
-
-    return {
-        "resolution": "instagram-story",
-        "quality": "high",
-        "cache": cache,
-        "comment": f"Midnight Souls Short: {plan.scene_summary}",
-        "scenes": scenes,
-    }
+def _build_video_prompt(
+    plan: VideoPromptPlan,
+    clip_number: int,
+    clip_prompt: str,
+    duration: float,
+) -> str:
+    prompt = (
+        f"Create one cinematic vertical 9:16 video clip, approximately "
+        f"{duration:.0f} seconds long, for a YouTube Short. "
+        f"The overall scene is: {plan.scene_summary.strip()}. "
+        "Keep the composition, subject, lighting, colors, weather, and camera "
+        "consistent with the other clips in this same scene. "
+        "Use slow, calm ambient motion and a cinematic 4K aesthetic. "
+        "Do not include speech, music, text, captions, logos, or watermarks. "
+        f"Scene {clip_number} prompt: {clip_prompt.strip()}"
+    )
+    if plan.negative_prompt:
+        prompt += f" Avoid: {plan.negative_prompt.strip()}."
+    return prompt
 
 
 def _clamp_clip_duration(hint: float) -> float:

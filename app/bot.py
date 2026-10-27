@@ -80,7 +80,7 @@ MENU_TEXT = (
     "/twitter — download an X/Twitter video, generate Shorts metadata, then publish\n"
     "/pixabay — fetch a 9:16 HD/4K Pixabay Short for Midnight Souls, then review & publish\n"
     "/pixabay_url — paste a Pixabay video URL, add music, then review & publish\n"
-    "/generate_shorts — invent Midnight Souls scenes with Gemini, render via JSON2Video, "
+    "/generate_shorts — invent Midnight Souls scenes and generate video with Gemini, "
     "add Pixabay music, then review & publish"
 )
 
@@ -406,8 +406,8 @@ async def generate_shorts_command(update: Update, context: ContextTypes.DEFAULT_
         return
 
     missing: list[str] = []
-    if not settings.json2video_api_key:
-        missing.append("JSON2VIDEO_API_KEY")
+    if not settings.gemini_api_key:
+        missing.append("GEMINI_API_KEY")
     if not settings.pixabay_api_key:
         missing.append("PIXABAY_API_KEY")
     if missing:
@@ -415,7 +415,7 @@ async def generate_shorts_command(update: Update, context: ContextTypes.DEFAULT_
             "Missing config: "
             + ", ".join(missing)
             + ".\n"
-            "JSON2Video: https://json2video.com/get-api-key/\n"
+            "Gemini: https://aistudio.google.com/apikey\n"
             "Pixabay: https://pixabay.com/api/docs/\n"
             "Add them to .env, then retry /generate_shorts."
         )
@@ -427,11 +427,9 @@ async def generate_shorts_command(update: Update, context: ContextTypes.DEFAULT_
         "Flow:\n"
         "1) Gemini invents 2–4 scene prompts (10–15s, max 20s)\n"
         "2) You approve the prompts\n"
-        "3) JSON2Video renders the scenes (Seedance)\n"
+        "3) Gemini generates the scene clips\n"
         "4) Pixabay music is muxed on\n"
         "5) You approve video → Gemini metadata → YouTube\n\n"
-        "Note: JSON2Video free tier has limited credits (~1–2 Shorts) and "
-        "adds a watermark; paid plans remove the watermark.\n\n"
         "Tap Start to begin, or Back to menu if this was a misclick.",
         reply_markup=_build_generate_shorts_confirm_keyboard(),
     )
@@ -1091,7 +1089,7 @@ def _format_prompt_plan_caption(plan: VideoPromptPlan) -> str:
         f"Music search: {plan.music_search_phrase}\n\n"
         f"Clips:\n{clips_block}\n\n"
         f"Negative: {plan.negative_prompt}\n\n"
-        "Approve → render with JSON2Video + Pixabay music\n"
+        "Approve → generate clips with Gemini + Pixabay music\n"
         "Regenerate → invent a new prompt plan\n"
         "Decline → discard"
     )
@@ -1188,7 +1186,7 @@ async def _run_generate_shorts_invent_prompts(
 
 
 async def _run_generate_shorts_render(message, job_id: str) -> None:
-    status_msg = await message.reply_text("Starting JSON2Video Shorts render...")
+    status_msg = await message.reply_text("Starting Gemini Shorts generation...")
     session = session_store.get(job_id)
     if not session or not session.video_prompts:
         await status_msg.edit_text("Prompt plan is missing; invent prompts again.")
@@ -1830,8 +1828,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer()
 
         missing: list[str] = []
-        if not settings.json2video_api_key:
-            missing.append("JSON2VIDEO_API_KEY")
+        if not settings.gemini_api_key:
+            missing.append("GEMINI_API_KEY")
         if not settings.pixabay_api_key:
             missing.append("PIXABAY_API_KEY")
         if missing:
