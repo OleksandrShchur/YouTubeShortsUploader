@@ -20,6 +20,7 @@ class Settings(BaseSettings):
 
     gemini_api_key: str
     gemini_model: str = "gemini-3.5-flash"
+    gemini_fallback_model: str = "gemini-3.5-flash-lite"
 
     youtube_client_secrets_file: Path = Path("secrets/client_secret.json")
     youtube_token_file: Path = Path("secrets/youtube_token.json")

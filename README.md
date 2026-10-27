@@ -114,6 +114,13 @@ Edit `.env` with your values. See [Environment variables](#environment-variables
 3. Optionally set `GEMINI_MODEL` (default: `gemini-3.5-flash`) for prompts and metadata.
 4. `/generate_shorts` uses `GEMINI_VIDEO_MODEL` (default: `gemini-omni-1.1-flash`).
 
+Prompt and metadata generation retry Gemini server errors up to three times per model
+with exponential backoff and jitter (1–4 seconds between attempts). If the primary
+model still fails, the same request is sent to `GEMINI_FALLBACK_MODEL` (default:
+`gemini-3.5-flash-lite`) with the same retry policy. Set it to an empty value to
+disable fallback. Client errors such as invalid credentials or quota errors fail
+immediately without retrying or switching models.
+
 ### 5. Pixabay API
 
 1. Open [Pixabay API docs](https://pixabay.com/api/docs/).
@@ -194,6 +201,7 @@ The entrypoint writes these variables to `secrets/client_secret.json` and `secre
 | `TELEGRAM_WEBHOOK_SECRET` | no | — | Shared secret verified via `X-Telegram-Bot-Api-Secret-Token` |
 | `GEMINI_API_KEY` | yes | — | Google AI Studio API key |
 | `GEMINI_MODEL` | no | `gemini-3.5-flash` | Gemini model for prompts/metadata |
+| `GEMINI_FALLBACK_MODEL` | no | `gemini-3.5-flash-lite` | Fallback for prompts/metadata after server-error retries; empty disables fallback |
 | `GEMINI_VIDEO_MODEL` | no | `gemini-omni-1.1-flash` | Gemini video-generation model for `/generate_shorts` |
 | `GENERATE_SHORTS_TARGET_DURATION_SECONDS` | no | `12` | Preferred total Short duration |
 | `GENERATE_SHORTS_MAX_DURATION_SECONDS` | no | `20` | Hard max Short duration |
