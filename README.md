@@ -5,7 +5,7 @@ Telegram bot pipeline for publishing YouTube Shorts. Four flows:
 1. **`/twitter`** — download a video from an X/Twitter post, generate metadata with Gemini, review, publish.
 2. **`/pixabay`** — pick 3 random tags, download a vertical HD Pixabay video, scrape matching Pixabay Music, mux audio trimmed to the video length, review video then metadata, publish.
 3. **`/pixabay_url`** — paste a Pixabay video page URL, take its first tags for music search, mux audio, review video then metadata, publish.
-4. **`/generate_shorts`** — Gemini invents Midnight Souls scene prompts, JSON2Video renders 2–4 vertical scenes, Pixabay music mux, then metadata review and publish.
+4. **`/generate_shorts`** — Gemini invents Midnight Souls scene prompts and generates 2–4 vertical clips, Pixabay music mux, then metadata review and publish.
 
 ## Flows
 
@@ -39,11 +39,9 @@ Telegram bot pipeline for publishing YouTube Shorts. Four flows:
 1. Admin sends `/generate_shorts` → confirmation with **Start** / **Back to menu**.
 2. Gemini invents a Midnight Souls prompt plan (2–4 seamless 9:16 clips, target **10–15s**, max **20s**) plus a Pixabay music search phrase.
 3. Prompt review: **Approve** / **Regenerate** / **Decline**.
-4. On approve, JSON2Video renders the scenes (`seedance-v1.5-pro`), downloads the MP4, scrapes Pixabay Music, and muxes audio.
+4. On approve, Gemini generates each scene clip, then the bot combines the clips, scrapes Pixabay Music, and muxes the audio.
 5. Video review: **Approve** → Gemini metadata; **Modify audio**; **Regenerate** (new prompts + re-render); **Decline**.
 6. Metadata review → YouTube upload (same as other flows).
-
-Free JSON2Video accounts have limited credits and add a watermark; paid plans remove the watermark.
 
 ### Pixabay URL
 
@@ -66,7 +64,6 @@ Free JSON2Video accounts have limited credits and add a watermark; paid plans re
 - Telegram bot token
 - Gemini API key (Google AI Studio)
 - Pixabay API key (`PIXABAY_API_KEY`) — for `/pixabay`, `/pixabay_url`, and `/generate_shorts` music
-- JSON2Video API key (`JSON2VIDEO_API_KEY`) — for `/generate_shorts` scene rendering
 - Google Cloud project with YouTube Data API v3 enabled
 - OAuth client credentials for desktop/installed app
 
@@ -114,7 +111,8 @@ Edit `.env` with your values. See [Environment variables](#environment-variables
 
 1. Create an API key in [Google AI Studio](https://aistudio.google.com/).
 2. Set `GEMINI_API_KEY`.
-3. Optionally set `GEMINI_MODEL` (default: `gemini-3.5-flash`).
+3. Optionally set `GEMINI_MODEL` (default: `gemini-3.5-flash`) for prompts and metadata.
+4. `/generate_shorts` uses `GEMINI_VIDEO_MODEL` (default: `gemini-omni-1.1-flash`).
 
 ### 5. Pixabay API
 
@@ -196,8 +194,7 @@ The entrypoint writes these variables to `secrets/client_secret.json` and `secre
 | `TELEGRAM_WEBHOOK_SECRET` | no | — | Shared secret verified via `X-Telegram-Bot-Api-Secret-Token` |
 | `GEMINI_API_KEY` | yes | — | Google AI Studio API key |
 | `GEMINI_MODEL` | no | `gemini-3.5-flash` | Gemini model for prompts/metadata |
-| `JSON2VIDEO_API_KEY` | for `/generate_shorts` | — | JSON2Video API key from [get-api-key](https://json2video.com/get-api-key/) |
-| `JSON2VIDEO_VIDEO_MODEL` | no | `seedance-v1.5-pro` | JSON2Video AI video model |
+| `GEMINI_VIDEO_MODEL` | no | `gemini-omni-1.1-flash` | Gemini video-generation model for `/generate_shorts` |
 | `GENERATE_SHORTS_TARGET_DURATION_SECONDS` | no | `12` | Preferred total Short duration |
 | `GENERATE_SHORTS_MAX_DURATION_SECONDS` | no | `20` | Hard max Short duration |
 | `PIXABAY_API_KEY` | for `/pixabay`, `/pixabay_url`, `/generate_shorts` music | — | Pixabay API key from [api docs](https://pixabay.com/api/docs/) |
